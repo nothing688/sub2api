@@ -226,7 +226,7 @@ def create_mailbox(
             domain=extra.get("skymail_domain", ""),
             proxy=proxy,
         )
-    elif provider == "cloudmail":
+    elif provider in ("cloudmail", "chat", "chatmail", "cloud-mail", "maillab"):
         timeout_raw = extra.get("cloudmail_timeout", extra.get("timeout", 30))
         try:
             timeout_value = int(timeout_raw)
@@ -234,20 +234,39 @@ def create_mailbox(
             timeout_value = 30
         return CloudMailMailbox(
             api_base=extra.get("cloudmail_api_base")
+            or extra.get("cloudmail_url")
             or extra.get("base_url")
             or "",
             admin_email=extra.get("cloudmail_admin_email")
             or extra.get("admin_email")
             or "",
             admin_password=extra.get("cloudmail_admin_password")
+            or extra.get("cloudmail_password")
             or extra.get("admin_password")
             or extra.get("api_key")
             or "",
-            domain=extra.get("cloudmail_domain") or extra.get("domain") or "",
+            domain=extra.get("cloudmail_domain")
+            or extra.get("defaultDomains")
+            or extra.get("domain")
+            or "",
             subdomain=extra.get("cloudmail_subdomain")
             or extra.get("subdomain")
             or "",
             timeout=timeout_value,
+            proxy=proxy,
+        )
+    elif provider in ("catchmail", "catchmail.io", "catch_mail"):
+        return CatchmailMailbox(
+            api_base=extra.get("catchmail_api_base") or "https://api.catchmail.io",
+            domain=extra.get("catchmail_domain") or "catchmail.io",
+            local_len=extra.get("catchmail_local_len") or 10,
+            proxy=proxy,
+        )
+    elif provider in ("mailtm", "mail.tm", "mail_tm", "mail-tm"):
+        return MailTmMailbox(
+            api_base=extra.get("mailtm_api_base") or "https://api.mail.tm",
+            domain=extra.get("mailtm_domain") or "",
+            local_len=extra.get("mailtm_local_len") or 10,
             proxy=proxy,
         )
     elif provider == "duckmail":
@@ -314,6 +333,8 @@ def create_mailbox(
             domain_override=extra.get("cfworker_domain_override", ""),
             domains=extra.get("cfworker_domains", ""),
             enabled_domains=extra.get("cfworker_enabled_domains", ""),
+            domain_mode=extra.get("cfworker_domain_mode", "fixed"),
+            rotate_state_path=extra.get("cfworker_rotate_state_path", ""),
             subdomain=extra.get("cfworker_subdomain", ""),
             domain_level_count=extra.get("email_domain_level_count", 2),
             random_subdomain=extra.get("cfworker_random_subdomain", False),
@@ -1416,6 +1437,483 @@ class SkyMailMailbox(BaseMailbox):
         )
 
 
+class CatchmailMailbox(BaseMailbox):
+    """Catchmail.io public disposable mailbox API.
+
+    Docs-style endpoints (no registration):
+      GET  /api/v1/mailbox?address=user@catchmail.io
+      GET  /api/v1/message/{id}?mailbox=user@catchmail.io
+    Any local-part @catchmail.io works; custom domains need MX → smtp.catchmail.io.
+    """
+
+    def __init__(
+        self,
+        api_base: str = "https://api.catchmail.io",
+        domain: str = "catchmail.io",
+        local_len: Any = 10,
+        proxy: str = None,
+    ):
+        self.api = str(api_base or "https://api.catchmail.io").rstrip("/")
+        self.domain = str(domain or "catchmail.io").strip().lstrip("@") or "catchmail.io"
+        try:
+            self.local_len = max(6, min(int(local_len or 10), 24))
+        except (TypeError, ValueError):
+            self.local_len = 10
+        self.proxy = build_requests_proxy_config(proxy)
+
+    def _headers(self) -> dict:
+        return {
+            "accept": "application/json",
+            "user-agent": "GrokPool-register-win/catchmail",
+        }
+
+    def _gen_local(self) -> str:
+        import string
+
+        alphabet = string.ascii_lowercase + string.digits
+        # avoid pure-digit local parts
+        first = random.choice(string.ascii_lowercase)
+        rest = "".join(random.choices(alphabet, k=max(self.local_len - 1, 5)))
+        return first + rest
+
+    def _list_messages(self, email: str) -> list:
+        import requests
+
+        r = requests.get(
+            f"{self.api}/api/v1/mailbox",
+            params={"address": email, "page": 1, "page_size": 50},
+            headers=self._headers(),
+            proxies=self.proxy,
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"Catchmail mailbox 失败: HTTP {r.status_code} {str(r.text or '')[:200]}"
+            )
+        try:
+            data = r.json()
+        except Exception as exc:
+            raise RuntimeError(f"Catchmail mailbox 非 JSON: {str(r.text or '')[:200]}") from exc
+        msgs = data.get("messages") if isinstance(data, dict) else None
+        if isinstance(msgs, list):
+            return msgs
+        if isinstance(data, list):
+            return data
+        return []
+
+    def _get_message_body(self, email: str, message_id: str) -> str:
+        import requests
+        from urllib.parse import quote
+
+        mid = str(message_id or "").strip()
+        if not mid:
+            return ""
+        url = f"{self.api}/api/v1/message/{quote(mid, safe='')}"
+        r = requests.get(
+            url,
+            params={"mailbox": email},
+            headers=self._headers(),
+            proxies=self.proxy,
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            return ""
+        try:
+            data = r.json()
+        except Exception:
+            return str(r.text or "")
+        if not isinstance(data, dict):
+            return str(data or "")
+        body = data.get("body") if isinstance(data.get("body"), dict) else {}
+        parts = [
+            str(data.get("subject") or ""),
+            str((body or {}).get("text") or ""),
+            str((body or {}).get("html") or ""),
+            str(data.get("text") or ""),
+            str(data.get("html") or ""),
+            str(data.get("content") or ""),
+        ]
+        return "\n".join(p for p in parts if p)
+
+    def get_email(self) -> MailboxAccount:
+        email = f"{self._gen_local()}@{self.domain}"
+        # touch mailbox so service knows the address (optional, GET is enough)
+        try:
+            self._list_messages(email)
+        except Exception as exc:
+            self._log(f"[Catchmail] 预热邮箱失败（可忽略）: {exc}")
+        self._log(f"[Catchmail] 生成邮箱: {email}")
+        return MailboxAccount(
+            email=email,
+            account_id=email,
+            extra={"provider": "catchmail", "domain": self.domain},
+        )
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        try:
+            msgs = self._list_messages(account.email)
+            return {str(m.get("id") or "") for m in msgs if m.get("id")}
+        except Exception:
+            return set()
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 180,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        import re
+
+        email = account.email
+        seen = set(before_ids or set())
+        exclude_codes = {
+            str(c).strip()
+            for c in (kwargs.get("exclude_codes") or set())
+            if str(c or "").strip()
+        }
+        otp_sent_at = kwargs.get("otp_sent_at")
+
+        def poll_once() -> Optional[str]:
+            try:
+                msgs = self._list_messages(email)
+                # newest first if date present
+                def _sort_key(m):
+                    return str(m.get("date") or m.get("id") or "")
+
+                for msg in sorted(msgs, key=_sort_key, reverse=True):
+                    mid = str(msg.get("id") or "")
+                    if not mid or mid in seen:
+                        continue
+                    # optional time filter using date field
+                    if otp_sent_at:
+                        date_s = str(msg.get("date") or "").strip()
+                        if date_s:
+                            try:
+                                from datetime import datetime, timezone
+
+                                # accept ...Z and fractional seconds
+                                ts = datetime.fromisoformat(
+                                    date_s.replace("Z", "+00:00")
+                                ).timestamp()
+                                if ts < float(otp_sent_at) - 2:
+                                    continue
+                            except Exception:
+                                pass
+                    seen.add(mid)
+                    subject = str(msg.get("subject") or "")
+                    body = self._get_message_body(email, mid)
+                    content = f"{subject}\n{body}"
+                    content = re.sub(
+                        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+                        "",
+                        content,
+                    )
+                    if keyword and keyword.lower() not in content.lower():
+                        continue
+                    code = self._safe_extract(content, code_pattern)
+                    if code and code in exclude_codes:
+                        continue
+                    if code:
+                        self._log(f"[Catchmail] 命中验证码 {code} · {email}")
+                        return code
+            except Exception as exc:
+                self._log(f"[Catchmail] 轮询失败: {exc}")
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
+
+
+class MailTmMailbox(BaseMailbox):
+    """mail.tm public disposable mailbox API (same shape as catchmail).
+
+    No admin key:
+      GET  /domains
+      POST /accounts   {address, password}
+      POST /token      {address, password}
+      GET  /messages
+      GET  /messages/{id}
+    """
+
+    def __init__(
+        self,
+        api_base: str = "https://api.mail.tm",
+        domain: str = "",
+        local_len: Any = 10,
+        proxy: str = None,
+    ):
+        self.api = str(api_base or "https://api.mail.tm").rstrip("/")
+        self.domain_override = str(domain or "").strip().lstrip("@")
+        try:
+            self.local_len = max(6, min(int(local_len or 10), 24))
+        except (TypeError, ValueError):
+            self.local_len = 10
+        self.proxy = build_requests_proxy_config(proxy)
+        self._token = ""
+        self._password = ""
+
+    def _headers(self, auth: bool = False) -> dict:
+        h = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "user-agent": "GrokPool-register-win/mailtm",
+        }
+        if auth and self._token:
+            h["authorization"] = f"Bearer {self._token}"
+        return h
+
+    def _gen_local(self) -> str:
+        import string
+
+        alphabet = string.ascii_lowercase + string.digits
+        first = random.choice(string.ascii_lowercase)
+        rest = "".join(random.choices(alphabet, k=max(self.local_len - 1, 5)))
+        return first + rest
+
+    def _pick_domain(self) -> str:
+        if self.domain_override:
+            return self.domain_override
+        import requests
+
+        r = requests.get(
+            f"{self.api}/domains",
+            headers=self._headers(),
+            proxies=self.proxy,
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"mail.tm domains 失败: HTTP {r.status_code} {str(r.text or '')[:200]}"
+            )
+        try:
+            data = r.json()
+        except Exception as exc:
+            raise RuntimeError(f"mail.tm domains 非 JSON: {str(r.text or '')[:200]}") from exc
+        members = []
+        if isinstance(data, dict):
+            members = data.get("hydra:member") or data.get("items") or data.get("domains") or []
+        elif isinstance(data, list):
+            members = data
+        for item in members or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("isActive") is False:
+                continue
+            dom = str(item.get("domain") or "").strip().lstrip("@")
+            if dom:
+                return dom
+        raise RuntimeError("mail.tm 无可用域名")
+
+    def _list_messages(self) -> list:
+        import requests
+
+        if not self._token:
+            return []
+        r = requests.get(
+            f"{self.api}/messages",
+            headers=self._headers(auth=True),
+            proxies=self.proxy,
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"mail.tm messages 失败: HTTP {r.status_code} {str(r.text or '')[:200]}"
+            )
+        try:
+            data = r.json()
+        except Exception as exc:
+            raise RuntimeError(f"mail.tm messages 非 JSON: {str(r.text or '')[:200]}") from exc
+        if isinstance(data, dict):
+            msgs = data.get("hydra:member") or data.get("messages") or data.get("items") or []
+            return msgs if isinstance(msgs, list) else []
+        if isinstance(data, list):
+            return data
+        return []
+
+    def _get_message_body(self, message_id: str) -> str:
+        import requests
+        from urllib.parse import quote
+
+        mid = str(message_id or "").strip()
+        if not mid or not self._token:
+            return ""
+        r = requests.get(
+            f"{self.api}/messages/{quote(mid, safe='')}",
+            headers=self._headers(auth=True),
+            proxies=self.proxy,
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            return ""
+        try:
+            data = r.json()
+        except Exception:
+            return str(r.text or "")
+        if not isinstance(data, dict):
+            return str(data or "")
+        parts = [
+            str(data.get("subject") or ""),
+            str(data.get("intro") or ""),
+            str(data.get("text") or ""),
+            str(data.get("html") or ""),
+            str(data.get("body") or ""),
+            str(data.get("content") or ""),
+        ]
+        # html can be list
+        html = data.get("html")
+        if isinstance(html, list):
+            parts.extend(str(x or "") for x in html)
+        return "\n".join(p for p in parts if p)
+
+    def get_email(self) -> MailboxAccount:
+        import requests
+        import string
+
+        domain = self._pick_domain()
+        local = self._gen_local()
+        email = f"{local}@{domain}"
+        password = "Gp_" + "".join(
+            random.choices(string.ascii_letters + string.digits, k=14)
+        )
+        r = requests.post(
+            f"{self.api}/accounts",
+            json={"address": email, "password": password},
+            headers=self._headers(),
+            proxies=self.proxy,
+            timeout=20,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"mail.tm create 失败: HTTP {r.status_code} {str(r.text or '')[:200]}"
+            )
+        tr = requests.post(
+            f"{self.api}/token",
+            json={"address": email, "password": password},
+            headers=self._headers(),
+            proxies=self.proxy,
+            timeout=20,
+        )
+        if tr.status_code >= 400:
+            raise RuntimeError(
+                f"mail.tm token 失败: HTTP {tr.status_code} {str(tr.text or '')[:200]}"
+            )
+        try:
+            tok = tr.json()
+        except Exception as exc:
+            raise RuntimeError(f"mail.tm token 非 JSON: {str(tr.text or '')[:200]}") from exc
+        self._token = str((tok or {}).get("token") or "").strip()
+        self._password = password
+        if not self._token:
+            raise RuntimeError("mail.tm token 为空")
+        self._log(f"[mail.tm] 生成邮箱: {email} · domain={domain}")
+        return MailboxAccount(
+            email=email,
+            account_id=email,
+            extra={
+                "provider": "mailtm",
+                "domain": domain,
+                "token": self._token,
+                "password": password,
+            },
+        )
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        # restore token if caller rehydrated account
+        extra = getattr(account, "extra", None) or {}
+        if isinstance(extra, dict) and extra.get("token") and not self._token:
+            self._token = str(extra.get("token") or "").strip()
+        try:
+            msgs = self._list_messages()
+            return {str(m.get("id") or "") for m in msgs if isinstance(m, dict) and m.get("id")}
+        except Exception:
+            return set()
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 180,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        import re
+
+        extra = getattr(account, "extra", None) or {}
+        if isinstance(extra, dict) and extra.get("token") and not self._token:
+            self._token = str(extra.get("token") or "").strip()
+        email = account.email
+        seen = set(before_ids or set())
+        exclude_codes = {
+            str(c).strip()
+            for c in (kwargs.get("exclude_codes") or set())
+            if str(c or "").strip()
+        }
+        otp_sent_at = kwargs.get("otp_sent_at")
+
+        def poll_once() -> Optional[str]:
+            try:
+                msgs = self._list_messages()
+
+                def _sort_key(m):
+                    return str(m.get("createdAt") or m.get("date") or m.get("id") or "")
+
+                for msg in sorted(
+                    [m for m in msgs if isinstance(m, dict)],
+                    key=_sort_key,
+                    reverse=True,
+                ):
+                    mid = str(msg.get("id") or "")
+                    if not mid or mid in seen:
+                        continue
+                    if otp_sent_at:
+                        date_s = str(msg.get("createdAt") or msg.get("date") or "").strip()
+                        if date_s:
+                            try:
+                                from datetime import datetime
+
+                                ts = datetime.fromisoformat(
+                                    date_s.replace("Z", "+00:00")
+                                ).timestamp()
+                                if ts < float(otp_sent_at) - 2:
+                                    continue
+                            except Exception:
+                                pass
+                    seen.add(mid)
+                    subject = str(msg.get("subject") or "")
+                    intro = str(msg.get("intro") or "")
+                    body = self._get_message_body(mid)
+                    content = f"{subject}\n{intro}\n{body}"
+                    content = re.sub(
+                        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+                        "",
+                        content,
+                    )
+                    if keyword and keyword.lower() not in content.lower():
+                        continue
+                    code = self._safe_extract(content, code_pattern)
+                    if code and code in exclude_codes:
+                        continue
+                    if code:
+                        self._log(f"[mail.tm] 命中验证码 {code} · {email}")
+                        return code
+            except Exception as exc:
+                self._log(f"[mail.tm] 轮询失败: {exc}")
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
+
+
 class CloudMailMailbox(BaseMailbox):
     """CloudMail 自建邮箱服务（genToken + emailList）"""
 
@@ -1675,14 +2173,119 @@ class CloudMailMailbox(BaseMailbox):
         with CloudMailMailbox._seen_ids_lock:
             return set(CloudMailMailbox._seen_ids.get(email, set()))
 
+    def _admin_login(self) -> str:
+        """POST /api/login → admin JWT for account management."""
+        import requests
+
+        self._ensure_config()
+        admin_email = self._resolve_admin_email()
+        r = requests.post(
+            f"{self.api}/api/login",
+            json={"email": admin_email, "password": self.admin_password},
+            headers=self._headers(),
+            proxies=self.proxy,
+            timeout=self.timeout,
+        )
+        try:
+            data = r.json() if r.content else {}
+        except Exception:
+            data = {}
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"CloudMail 登录失败: HTTP {r.status_code} {str(r.text or '')[:200]}"
+            )
+        # tolerate {code:200,data:{token}} or {token}
+        token = ""
+        if isinstance(data, dict):
+            if data.get("code") not in (None, 200) and data.get("code") != 0:
+                raise RuntimeError(f"CloudMail 登录失败: {data}")
+            body = data.get("data") if isinstance(data.get("data"), dict) else data
+            token = str(
+                (body or {}).get("token")
+                or (body or {}).get("access_token")
+                or data.get("token")
+                or ""
+            ).strip()
+        if not token:
+            raise RuntimeError(f"CloudMail 登录失败: 响应无 token {str(data)[:200]}")
+        return token
+
+    def _admin_add_address(self, address: str) -> dict:
+        """POST /api/account/add — create mailbox on catch-all domain (maillab/cloud-mail)."""
+        import requests
+
+        jwt = self._admin_login()
+        r = requests.post(
+            f"{self.api}/api/account/add",
+            json={"email": address, "token": ""},
+            headers=self._headers(jwt),
+            proxies=self.proxy,
+            timeout=self.timeout,
+        )
+        try:
+            data = r.json() if r.content else {}
+        except Exception:
+            data = {}
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"CloudMail 添加邮箱失败: HTTP {r.status_code} {str(r.text or '')[:200]}"
+            )
+        if isinstance(data, dict) and data.get("code") not in (None, 200, 0):
+            raise RuntimeError(f"CloudMail 添加邮箱失败: {data}")
+        body = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+        return body if isinstance(body, dict) else {}
+
+    def _admin_delete_address(self, account_id: Any) -> None:
+        if account_id in (None, ""):
+            return
+        import requests
+
+        try:
+            jwt = self._admin_login()
+            requests.delete(
+                f"{self.api}/api/account/delete",
+                params={"accountId": account_id},
+                headers=self._headers(jwt),
+                proxies=self.proxy,
+                timeout=self.timeout,
+            )
+        except Exception as exc:
+            self._log(f"[CloudMail] 删除邮箱失败 accountId={account_id}: {exc}")
+
     def get_email(self) -> MailboxAccount:
+        """Create a random address via admin API (not just invent a string).
+
+        Aligns with grokRegister-cpa CloudMail flow:
+        login → /api/account/add → later poll via public emailList.
+        """
         self._ensure_config()
         email = self._build_email()
-        self._log(f"[CloudMail] 生成邮箱: {email}")
-        return MailboxAccount(email=email, account_id=email)
+        account_id = None
+        try:
+            result = self._admin_add_address(email)
+            account_id = result.get("accountId") or result.get("id") or result.get("account_id")
+            self._log(f"[CloudMail] 已创建邮箱: {email} accountId={account_id or '-'}")
+        except Exception as exc:
+            # Some CloudMail deployments are pure catch-all (no per-address create).
+            # Fall back so registration can still try to receive if routing is catch-all.
+            self._log(f"[CloudMail] 创建地址失败，回退 catch-all 模式: {exc}")
+            self._log(f"[CloudMail] 生成邮箱(未登记): {email}")
+        # warm public token early
+        try:
+            self._get_token()
+        except Exception as exc:
+            self._log(f"[CloudMail] 预取 public token 失败（收信时会重试）: {exc}")
+        return MailboxAccount(
+            email=email,
+            account_id=str(account_id) if account_id is not None else email,
+            extra={
+                "provider": "cloudmail",
+                "cloudmail_account_id": account_id,
+            },
+        )
 
     def get_current_ids(self, account: MailboxAccount) -> set:
-        target = account.account_id or account.email
+        target = account.email or account.account_id
         try:
             mails = self._list_mails(target)
             return {self._mail_id(msg, idx) for idx, msg in enumerate(mails)}
@@ -1693,12 +2296,14 @@ class CloudMailMailbox(BaseMailbox):
         self,
         account: MailboxAccount,
         keyword: str = "",
-        timeout: int = 120,
+        timeout: int = 180,
         before_ids: set = None,
         code_pattern: str = None,
         **kwargs,
     ) -> str:
-        target = account.account_id or account.email
+        import re
+
+        target = account.email or account.account_id
         seen = set(before_ids or set())
         seen.update(self._load_seen_ids(target))
         otp_sent_at = kwargs.get("otp_sent_at")
@@ -1707,10 +2312,13 @@ class CloudMailMailbox(BaseMailbox):
             for code in (kwargs.get("exclude_codes") or set())
             if str(code or "").strip()
         }
+        extra = account.extra if isinstance(account.extra, dict) else {}
+        cloudmail_account_id = extra.get("cloudmail_account_id")
 
         def poll_once() -> Optional[str]:
             try:
                 mails = self._list_mails(target)
+                self._log(f"[CloudMail] 本轮邮件数: {len(mails)} · {target}")
                 for idx, msg in enumerate(mails):
                     mid = self._mail_id(msg, idx)
                     if mid in seen:
@@ -1722,14 +2330,28 @@ class CloudMailMailbox(BaseMailbox):
                     if otp_sent_at and msg_ts and msg_ts < float(otp_sent_at):
                         continue
 
-                    content = " ".join(
-                        [
-                            str(msg.get("subject") or ""),
-                            str(msg.get("content") or ""),
-                            str(msg.get("text") or ""),
-                            str(msg.get("html") or ""),
-                        ]
-                    )
+                    parts = []
+                    for field in (
+                        "subject",
+                        "content",
+                        "text",
+                        "textContent",
+                        "text_content",
+                        "body",
+                        "snippet",
+                        "intro",
+                        "html",
+                        "htmlContent",
+                        "html_content",
+                    ):
+                        value = msg.get(field)
+                        if isinstance(value, str) and value.strip():
+                            parts.append(value)
+                        elif isinstance(value, list):
+                            parts.extend(str(x) for x in value if x)
+                    content = " ".join(parts)
+                    # strip tags lightly
+                    content = re.sub(r"<[^>]+>", " ", content)
                     if keyword and keyword.lower() not in content.lower():
                         continue
                     code = self._safe_extract(content, code_pattern)
@@ -1738,15 +2360,20 @@ class CloudMailMailbox(BaseMailbox):
                     if code:
                         self._log(f"[CloudMail] 命中验证码: {code}")
                         return code
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log(f"[CloudMail] 轮询失败: {exc}")
             return None
 
-        return self._run_polling_wait(
-            timeout=timeout,
-            poll_interval=3,
-            poll_once=poll_once,
-        )
+        try:
+            return self._run_polling_wait(
+                timeout=timeout,
+                poll_interval=3,
+                poll_once=poll_once,
+            )
+        finally:
+            # best-effort cleanup of created address
+            if cloudmail_account_id not in (None, ""):
+                self._admin_delete_address(cloudmail_account_id)
 
 
 class DuckMailMailbox(BaseMailbox):
@@ -2618,6 +3245,8 @@ class CFWorkerMailbox(BaseMailbox):
         domain_override: str = "",
         domains: Any = None,
         enabled_domains: Any = None,
+        domain_mode: str = "fixed",
+        rotate_state_path: str = "",
         subdomain: str = "",
         domain_level_count: Any = 2,
         random_subdomain: Any = False,
@@ -2637,6 +3266,11 @@ class CFWorkerMailbox(BaseMailbox):
             self.enabled_domains = [d for d in raw_enabled_domains if d in allowed]
         else:
             self.enabled_domains = raw_enabled_domains
+        mode = str(domain_mode or "fixed").strip().lower()
+        if mode not in ("fixed", "random", "rotate"):
+            mode = "fixed"
+        self.domain_mode = mode
+        self.rotate_state_path = str(rotate_state_path or "").strip()
         self.subdomain = self._normalize_subdomain(subdomain)
         self.domain_level_count = self._parse_domain_level_count(domain_level_count)
         self.random_subdomain = self._to_bool(random_subdomain)
@@ -2785,12 +3419,64 @@ class CFWorkerMailbox(BaseMailbox):
             domains.append(domain)
         return domains
 
+    def _domain_pool(self) -> list[str]:
+        if self.enabled_domains:
+            return list(self.enabled_domains)
+        if self.domain:
+            return [self.domain]
+        if self.domains:
+            return list(self.domains)
+        return []
+
+    def _rotate_domain(self, pool: list[str]) -> str:
+        """Round-robin across processes via a small state file when possible."""
+        if len(pool) == 1:
+            return pool[0]
+        path = self.rotate_state_path
+        if not path:
+            # best-effort fallback: process-local random-ish but stable-ish
+            return pool[int(time.time()) % len(pool)]
+        try:
+            import json
+            from pathlib import Path
+
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            idx = 0
+            if p.exists():
+                try:
+                    obj = json.loads(p.read_text(encoding="utf-8-sig") or "{}")
+                    idx = int(obj.get("index") or 0)
+                except Exception:
+                    idx = 0
+            chosen = pool[idx % len(pool)]
+            nxt = (idx + 1) % (10**9)
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps({"index": nxt, "last": chosen}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(p)
+            return chosen
+        except Exception:
+            return pool[int(time.time()) % len(pool)]
+
     def _pick_domain(self) -> str:
+        # explicit override always wins (legacy single-domain force)
         if self.domain_override:
             return self.domain_override
-        if self.enabled_domains:
-            return random.choice(self.enabled_domains)
-        return self.domain
+        pool = self._domain_pool()
+        if not pool:
+            return self.domain
+        mode = self.domain_mode or "fixed"
+        if mode == "random" and len(pool) > 1:
+            return random.choice(pool)
+        if mode == "rotate" and len(pool) > 1:
+            return self._rotate_domain(pool)
+        # fixed / single
+        if self.domain and self.domain in pool:
+            return self.domain
+        return pool[0]
 
     def _generate_subdomain_label(self, length: int = 6) -> str:
         import string

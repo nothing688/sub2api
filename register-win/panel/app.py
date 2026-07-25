@@ -31,6 +31,24 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+# Windows system proxy (Clash) hijacks 127.0.0.1:18080 → intermittent HTTP 502 on admin push.
+# Keep loopback / local Sub2 out of HTTP(S)_PROXY for this process.
+_no_proxy_bits = [
+    x.strip()
+    for x in str(os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "").split(",")
+    if x.strip()
+]
+for _host in (
+    "127.0.0.1",
+    "localhost",
+    "::1",
+    "sub2api",
+    "sub2api.local",
+):
+    if _host not in _no_proxy_bits:
+        _no_proxy_bits.append(_host)
+os.environ["NO_PROXY"] = ",".join(_no_proxy_bits)
+os.environ["no_proxy"] = os.environ["NO_PROXY"]
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
 from flask import (
@@ -835,6 +853,12 @@ _sub2_state: Dict = {
     "target_group_platform": "",
 }
 _sub2_jwt_cache = {"token": SUB2API_JWT, "at": 0.0}
+# Admin API is easily starved when Sub2 is busy with long /v1/responses calls.
+# Serialize admin traffic + cache groups so the panel does not stampede 502s.
+_sub2_http_sema = threading.Semaphore(int(os.environ.get("SUB2_HTTP_CONCURRENCY", "2") or "2"))
+_sub2_groups_cache: Dict = {"at": 0.0, "groups": [], "ttl": float(os.environ.get("SUB2_GROUPS_CACHE_TTL", "45") or "45")}
+# Force direct TCP to Sub2 — never inherit Windows/Clash system proxy for admin calls.
+_SUB2_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _load_sub2_group_cfg() -> dict:
@@ -908,18 +932,53 @@ def sub2_status() -> dict:
         }
 
 
-def _sub2_login_jwt() -> str:
+def _sub2_clear_jwt_cache() -> None:
+    with _sub2_lock:
+        _sub2_jwt_cache["token"] = ""
+        _sub2_jwt_cache["at"] = 0.0
+
+
+def _sub2_is_transient_http(code: int) -> bool:
+    return int(code or 0) in (408, 425, 429, 500, 502, 503, 504)
+
+
+def _sub2_is_transient_exc(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return _sub2_is_transient_http(int(getattr(exc, "code", 0) or 0))
+    if isinstance(exc, (TimeoutError, urllib.error.URLError, ConnectionError, OSError)):
+        return True
+    msg = str(exc or "").lower()
+    return any(
+        x in msg
+        for x in (
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "connection aborted",
+            "bad gateway",
+            "service unavailable",
+            "gateway timeout",
+            "10054",
+            "10053",
+            "10060",
+        )
+    )
+
+
+def _sub2_login_jwt(force: bool = False) -> str:
     """Login admin and cache JWT briefly."""
     if SUB2API_JWT:
         return SUB2API_JWT
     if not (SUB2API_ADMIN_EMAIL and SUB2API_ADMIN_PASSWORD):
         return ""
     now = time.time()
-    with _sub2_lock:
-        tok = str(_sub2_jwt_cache.get("token") or "")
-        at = float(_sub2_jwt_cache.get("at") or 0)
-        if tok and now - at < 6 * 3600:
-            return tok
+    if not force:
+        with _sub2_lock:
+            tok = str(_sub2_jwt_cache.get("token") or "")
+            at = float(_sub2_jwt_cache.get("at") or 0)
+            if tok and now - at < 6 * 3600:
+                return tok
     payload = json.dumps(
         {"email": SUB2API_ADMIN_EMAIL, "password": SUB2API_ADMIN_PASSWORD},
         ensure_ascii=False,
@@ -931,7 +990,7 @@ def _sub2_login_jwt() -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _SUB2_OPENER.open(req, timeout=30) as resp:
             body = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as e:
         raise RuntimeError(f"sub2api login failed: {e}") from e
@@ -955,7 +1014,7 @@ def _sub2_login_jwt() -> str:
     return token
 
 
-def _sub2_auth_headers() -> dict:
+def _sub2_auth_headers(force_login: bool = False) -> dict:
     try:
         refresh_sub2_settings_from_config()
     except Exception:
@@ -964,38 +1023,113 @@ def _sub2_auth_headers() -> dict:
     if SUB2API_ADMIN_API_KEY:
         headers["x-api-key"] = SUB2API_ADMIN_API_KEY
         return headers
-    jwt = _sub2_login_jwt()
+    if force_login:
+        _sub2_clear_jwt_cache()
+    jwt = _sub2_login_jwt(force=force_login)
     if not jwt:
         raise RuntimeError("missing SUB2API_ADMIN_API_KEY or admin email/password")
     headers["Authorization"] = f"Bearer {jwt}"
     return headers
 
 
-def _sub2_request(method: str, path: str, payload: Optional[dict] = None, timeout: int = 30) -> dict:
-    url = f"{SUB2API_BASE_URL}{path}"
-    headers = _sub2_auth_headers()
+def _sub2_http_json(
+    method: str,
+    url: str,
+    *,
+    payload: Optional[dict] = None,
+    timeout: int = 30,
+    retries: int = 3,
+    headers: Optional[dict] = None,
+    quiet: bool = False,
+) -> Tuple[int, str, object]:
+    """POST/GET JSON with retries on 502/503/gateway blips and one re-login on 401."""
+    method_u = (method or "GET").upper()
     data = None
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    last_err: Optional[BaseException] = None
+    force_login = False
+    attempts = max(1, int(retries or 1))
+    # Keep admin calls from stampeding Sub2 while gateway is busy with chat.
+    acquired = _sub2_http_sema.acquire(timeout=max(5.0, float(timeout) + 5.0))
+    if not acquired:
+        raise RuntimeError(f"{method_u} {url} failed: sub2 admin queue busy")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            code = resp.status
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
-        raise RuntimeError(f"HTTP {e.code} {path}: {body[:300]}") from e
-    except Exception as e:
-        raise RuntimeError(f"{method} {path} failed: {e}") from e
-    if not raw:
-        return {"_http": code}
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        return {"_http": code, "_raw": raw}
+        for attempt in range(1, attempts + 1):
+            try:
+                hdrs = headers if headers is not None else _sub2_auth_headers(force_login=force_login)
+                force_login = False
+                req = urllib.request.Request(url, data=data, headers=hdrs, method=method_u)
+                # Always direct to Sub2 (ProxyHandler({})), ignore Windows system proxy / Clash.
+                with _SUB2_OPENER.open(req, timeout=timeout) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    code = int(resp.status)
+                obj: object
+                if not raw:
+                    obj = {"_http": code}
+                else:
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        obj = {"_http": code, "_raw": raw}
+                if isinstance(obj, dict):
+                    obj["_http"] = code
+                return code, raw, obj
+            except urllib.error.HTTPError as e:
+                last_err = e
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+                except Exception:
+                    body = ""
+                code = int(getattr(e, "code", 0) or 0)
+                # expired/invalid JWT → re-login once then continue retry loop
+                if code == 401 and headers is None and attempt < attempts:
+                    _sub2_clear_jwt_cache()
+                    force_login = True
+                    time.sleep(0.4)
+                    continue
+                if _sub2_is_transient_http(code) and attempt < attempts:
+                    # Gateway stream load used to starve admin via proxy; keep longer backoff.
+                    sleep_s = min(12.0, 0.8 * (2 ** (attempt - 1)))
+                    if not quiet and (attempt == attempts - 1 or code in (502, 503, 504)):
+                        log_line(
+                            f"[SUB2] transient HTTP {code} {method_u} retry {attempt}/{attempts}"
+                        )
+                    time.sleep(sleep_s)
+                    continue
+                raise RuntimeError(f"HTTP {code} {method_u} {url}: {body[:300]}") from e
+            except Exception as e:
+                last_err = e
+                if _sub2_is_transient_exc(e) and attempt < attempts:
+                    sleep_s = min(12.0, 0.8 * (2 ** (attempt - 1)))
+                    if not quiet and attempt == attempts - 1:
+                        log_line(
+                            f"[SUB2] transient error {method_u} retry {attempt}/{attempts}: {e}"
+                        )
+                    time.sleep(sleep_s)
+                    continue
+                raise RuntimeError(f"{method_u} {url} failed: {e}") from e
+        raise RuntimeError(f"{method_u} {url} failed after retries: {last_err}")
+    finally:
+        _sub2_http_sema.release()
+
+
+def _sub2_request(
+    method: str,
+    path: str,
+    payload: Optional[dict] = None,
+    timeout: int = 30,
+    retries: int = 3,
+    quiet: bool = False,
+) -> dict:
+    url = f"{SUB2API_BASE_URL}{path}"
+    _code, _raw, obj = _sub2_http_json(
+        method, url, payload=payload, timeout=timeout, retries=retries, quiet=quiet
+    )
     if isinstance(obj, dict):
-        obj["_http"] = code
-    return obj
+        return obj
+    return {"_http": _code, "_raw": _raw, "data": obj}
 
 
 def _sub2_unwrap(obj: dict):
@@ -1006,29 +1140,47 @@ def _sub2_unwrap(obj: dict):
     return obj
 
 
-def sub2_list_groups() -> List[dict]:
-    """List groups from Sub2API admin API."""
-    # prefer /all then fallback list
-    try:
-        obj = _sub2_request("GET", "/api/v1/admin/groups/all")
-        data = _sub2_unwrap(obj)
+def sub2_list_groups(force: bool = False) -> List[dict]:
+    """List groups from Sub2API admin API (cached to avoid 502 storms)."""
+    def _extract(data) -> List[dict]:
         if isinstance(data, list):
             return [g for g in data if isinstance(g, dict)]
-        if isinstance(data, dict) and isinstance(data.get("items"), list):
-            return [g for g in data["items"] if isinstance(g, dict)]
-        if isinstance(data, dict) and isinstance(data.get("groups"), list):
-            return [g for g in data["groups"] if isinstance(g, dict)]
-    except Exception:
-        pass
-    obj = _sub2_request("GET", "/api/v1/admin/groups?page_size=200")
-    data = _sub2_unwrap(obj)
-    if isinstance(data, list):
-        return [g for g in data if isinstance(g, dict)]
-    if isinstance(data, dict):
-        for k in ("items", "list", "groups", "data"):
-            if isinstance(data.get(k), list):
-                return [g for g in data[k] if isinstance(g, dict)]
-    return []
+        if isinstance(data, dict):
+            for k in ("items", "list", "groups", "data"):
+                if isinstance(data.get(k), list):
+                    return [g for g in data[k] if isinstance(g, dict)]
+        return []
+
+    now = time.time()
+    ttl = float(_sub2_groups_cache.get("ttl") or 45)
+    cached = list(_sub2_groups_cache.get("groups") or [])
+    cache_at = float(_sub2_groups_cache.get("at") or 0)
+    if not force and cached and now - cache_at < ttl:
+        return cached
+
+    errors: List[str] = []
+    # /all is light and stable; paginated list is fallback
+    for path in (
+        "/api/v1/admin/groups/all",
+        "/api/v1/admin/groups?page=1&page_size=200",
+    ):
+        try:
+            obj = _sub2_request("GET", path, timeout=20, retries=2, quiet=True)
+            groups = _extract(_sub2_unwrap(obj))
+            if groups:
+                with _sub2_lock:
+                    _sub2_groups_cache["groups"] = groups
+                    _sub2_groups_cache["at"] = time.time()
+                return groups
+            errors.append(f"{path}: empty")
+        except Exception as e:
+            errors.append(f"{path}: {e}")
+            continue
+
+    # Serve stale cache while Sub2 is busy instead of 502-spamming the UI/logs.
+    if cached:
+        return cached
+    raise RuntimeError("list groups failed: " + " | ".join(errors[:3]))
 
 
 def sub2_create_group(name: str, platform: str = "grok", description: str = "") -> dict:
@@ -1057,33 +1209,36 @@ def sub2_find_account_id_by_email(email: str) -> Optional[int]:
     email = (email or "").strip().lower()
     if not email:
         return None
-    # search endpoint
     q = urllib.parse.quote(email)
-    try:
-        obj = _sub2_request("GET", f"/api/v1/admin/accounts?search={q}&page_size=50")
-        data = _sub2_unwrap(obj)
-        items = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            for k in ("items", "list", "accounts", "data"):
-                if isinstance(data.get(k), list):
-                    items = data[k]
-                    break
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            name = str(it.get("name") or "").lower()
-            em = ""
-            cred = it.get("credentials") if isinstance(it.get("credentials"), dict) else {}
-            extra = it.get("extra") if isinstance(it.get("extra"), dict) else {}
-            em = str(cred.get("email") or extra.get("email") or "").lower()
-            if email == name or email == em or email in name:
-                aid = it.get("id")
-                if aid is not None:
-                    return int(aid)
-    except Exception as e:
-        log_line(f"[SUB2] find account by email fail: {e}")
+    paths = [
+        f"/api/v1/admin/accounts?search={q}&page_size=50&platform=grok",
+        f"/api/v1/admin/accounts?search={q}&page_size=50",
+    ]
+    for path in paths:
+        try:
+            obj = _sub2_request("GET", path, timeout=30)
+            data = _sub2_unwrap(obj)
+            items = []
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                for k in ("items", "list", "accounts", "data"):
+                    if isinstance(data.get(k), list):
+                        items = data[k]
+                        break
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                name = str(it.get("name") or "").lower()
+                cred = it.get("credentials") if isinstance(it.get("credentials"), dict) else {}
+                extra = it.get("extra") if isinstance(it.get("extra"), dict) else {}
+                em = str(cred.get("email") or extra.get("email") or it.get("email") or "").lower()
+                if email == name or email == em or email in name:
+                    aid = it.get("id")
+                    if aid is not None:
+                        return int(aid)
+        except Exception as e:
+            log_line(f"[SUB2] find account by email fail ({path}): {e}")
     return None
 
 
@@ -1158,12 +1313,15 @@ def _sub2_post_import_bind_and_probe(email: str, account_id: Optional[int] = Non
             sub2_bind_account_groups(aid, [gid])
             bind_msg = f" bound_group={gid} account_id={aid}"
         except Exception as be:
-            bind_msg = f" bind_fail={be} account_id={aid}"
+            # bind failure must not flip a successful import into push-fail
+            bind_msg = f" bind_soft_fail={be} account_id={aid}"
     else:
         bind_msg = f" account_id={aid}"
 
+    # Quota probe is best-effort only. Upstream 402/403/502 is common on free Grok
+    # and must NEVER mark the whole Sub2 push as failed.
     last_probe_err = ""
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
             pr = sub2_probe_grok_quota(aid)
             pdata = _sub2_unwrap(pr) if isinstance(pr, dict) else pr
@@ -1185,16 +1343,15 @@ def _sub2_post_import_bind_and_probe(email: str, account_id: Optional[int] = Non
                 probe_msg = f" probe_ok attempt={attempt} status={st} source={src}"
                 last_probe_err = ""
                 break
-            low = (probe_err or "").lower()
-            if st in (0, 403, 429, 503) or "permission-denied" in low or "chat endpoint" in low or "cloudflare" in low:
-                last_probe_err = f"soft_fail status={st} source={src} err={(probe_err or '')[:120]}"
-            else:
-                probe_msg = f" probe_done attempt={attempt} status={st} source={src}"
-                last_probe_err = ""
+            last_probe_err = f"status={st} source={src} err={(probe_err or '')[:120]}"
+            # 402/403/429 = account/upstream reality, not transport flake — stop early
+            if st in (401, 402, 403, 429):
                 break
         except Exception as pe:
-            last_probe_err = str(pe)
-        time.sleep(2.0 * attempt)
+            last_probe_err = str(pe)[:180]
+            if not _sub2_is_transient_exc(pe) and "HTTP 40" in str(pe):
+                break
+        time.sleep(1.2 * attempt)
     if last_probe_err:
         probe_msg = f" probe_soft_fail={last_probe_err} kept=1"
     return bind_msg + probe_msg
@@ -1363,35 +1520,49 @@ def push_cpa_to_sub2api(cpa_entry: dict, email_hint: str = "") -> Tuple[bool, st
             "data": payload,
             "skip_default_group_bind": skip_default,
         }
-        headers = _sub2_auth_headers()
-        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
+        code, resp_body, obj = _sub2_http_json(
+            "POST",
             f"{SUB2API_BASE_URL}/api/v1/admin/accounts/data",
-            data=raw,
-            headers=headers,
-            method="POST",
+            payload=body,
+            timeout=90,
+            retries=5,
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            resp_body = resp.read().decode("utf-8", errors="replace")
-            code = resp.status
         created = failed = 0
         try:
-            obj = json.loads(resp_body)
             data = obj.get("data") if isinstance(obj, dict) and isinstance(obj.get("data"), dict) else obj
             if isinstance(data, dict):
                 created = int(data.get("account_created") or data.get("created") or 0)
                 failed = int(data.get("account_failed") or data.get("failed") or 0)
         except Exception:
             pass
+        # duplicate import often returns created=0 failed=0 — still success if account exists
         msg = f"mode=cpa-data http={code} created={created} failed={failed}"
+        if failed and not created:
+            # one more chance: account may already exist from watcher race
+            existing = sub2_find_account_id_by_email(email) if email else None
+            if existing:
+                extra = _sub2_post_import_bind_and_probe(email, account_id=int(existing))
+                msg = msg + f" reused_account_id={existing}" + extra
+                _sub2_mark_push(True, email, msg)
+                return True, msg
+            _sub2_mark_push(False, email, msg + " " + str(resp_body)[:200])
+            return False, msg
         extra = _sub2_post_import_bind_and_probe(email)
         msg = msg + extra
-        if failed and not created:
-            _sub2_mark_push(False, email, msg + " " + resp_body[:200])
-            return False, msg
         _sub2_mark_push(True, email, msg)
         return True, msg
     except Exception as e:
+        # if transport failed but account already landed (watcher / partial), count success
+        existing = None
+        try:
+            existing = sub2_find_account_id_by_email(email) if email else None
+        except Exception:
+            existing = None
+        if existing:
+            extra = _sub2_post_import_bind_and_probe(email, account_id=int(existing))
+            msg = f"mode=cpa-data recovered_existing id={existing} after_err={e}{extra}"
+            _sub2_mark_push(True, email, msg)
+            return True, msg
         err = f"mode=cpa-data err={e}"
         _sub2_mark_push(False, email, err)
         return False, err
@@ -1426,6 +1597,118 @@ def load_config() -> dict:
     return {}
 
 
+def _normalize_domain_name(value) -> str:
+    text = str(value or "").strip().lower().lstrip("@")
+    if "://" in text:
+        try:
+            from urllib.parse import urlparse
+
+            host = urlparse(text if "://" in text else f"https://{text}").hostname or ""
+            text = host.strip().lower()
+        except Exception:
+            text = text.split("/")[0]
+    return text.strip().strip(".")
+
+
+def _parse_domain_list(value) -> list:
+    """Accept list/comma/newline/JSON-ish domain lists."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    items = parsed
+                else:
+                    items = [text]
+            except Exception:
+                items = re.split(r"[\s,;|]+", text)
+        else:
+            items = re.split(r"[\s,;|]+", text)
+    out: list = []
+    seen = set()
+    for item in items:
+        dom = _normalize_domain_name(item)
+        if not dom or "." not in dom or dom in seen:
+            continue
+        seen.add(dom)
+        out.append(dom)
+    return out
+
+
+def _cfworker_domain_mode(value) -> str:
+    mode = str(value or "fixed").strip().lower() or "fixed"
+    if mode not in ("fixed", "random", "rotate"):
+        return "fixed"
+    return mode
+
+
+def fetch_cfworker_domains(
+    api_url: str = "",
+    admin_token: str = "",
+    custom_auth: str = "",
+    proxy: str = "",
+) -> dict:
+    """Pull domain whitelist from cloudflare_temp_email open_api/settings."""
+    import requests
+
+    cfg = load_config()
+    api = str(api_url or cfg.get("cfworker_api_url") or cfg.get("cloudflare_api_base") or "").strip().rstrip("/")
+    token = str(admin_token or cfg.get("cfworker_admin_token") or cfg.get("cloudflare_api_key") or "").strip()
+    site_pw = str(custom_auth or cfg.get("cfworker_custom_auth") or "").strip()
+    proxies = None
+    px = str(proxy or cfg.get("proxy") or "").strip()
+    if px:
+        proxies = {"http": px, "https": px}
+    if not api:
+        raise ValueError("未配置 cfworker_api_url")
+    headers = {"accept": "application/json"}
+    if token:
+        headers["x-admin-auth"] = token
+    if site_pw:
+        headers["x-custom-auth"] = site_pw
+    r = requests.get(f"{api}/open_api/settings", headers=headers, proxies=proxies, timeout=20)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Worker settings HTTP {r.status_code}: {(r.text or '')[:200]}")
+    try:
+        data = r.json() if isinstance(r.json(), dict) else {}
+    except Exception as exc:
+        raise RuntimeError(f"Worker settings 非 JSON: {(r.text or '')[:200]}") from exc
+    # some versions nest under result/data
+    if not any(k in data for k in ("domains", "defaultDomains", "default_domains")):
+        for key in ("result", "data", "settings"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                data = nested
+                break
+    domains = _parse_domain_list(data.get("domains") or data.get("DOMAINS") or [])
+    defaults = _parse_domain_list(
+        data.get("defaultDomains")
+        or data.get("default_domains")
+        or data.get("DEFAULT_DOMAINS")
+        or []
+    )
+    # union keep order: defaults first then rest
+    all_domains: list = []
+    seen = set()
+    for d in defaults + domains:
+        if d not in seen:
+            seen.add(d)
+            all_domains.append(d)
+    return {
+        "api": api,
+        "domains": all_domains,
+        "default_domains": defaults,
+        "raw_keys": sorted([k for k in data.keys()])[:40],
+    }
+
+
 def email_config_public(cfg: Optional[dict] = None) -> dict:
     """Email settings for panel UI (multi-provider dropdown)."""
     c = cfg if isinstance(cfg, dict) else load_config()
@@ -1449,8 +1732,10 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
         {"id": "luckmail", "label": "LuckMail（接码/买邮）"},
         {"id": "mailnest", "label": "MailNest（mailnest.top）"},
         {"id": "gmail_forward", "label": "域名转发→Gmail（无限别名）"},
+        {"id": "catchmail", "label": "Catchmail.io（公开临时邮）"},
+        {"id": "mailtm", "label": "mail.tm（公开临时邮）"},
         {"id": "skymail", "label": "SkyMail"},
-        {"id": "cloudmail", "label": "CloudMail"},
+        {"id": "cloudmail", "label": "CloudMail（自建 maillab）"},
         {"id": "freemail", "label": "Freemail 自建"},
         {"id": "opentrashmail", "label": "OpenTrashMail"},
         {"id": "laoudo", "label": "Laoudo 固定邮箱"},
@@ -1462,7 +1747,21 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
     hint = (
         "公共 Tempmailer 已移除（滥用后拒收 xAI 验证码）。"
         "请从下拉框选择邮箱源；自建/CF Worker 通常更稳，公共源可能仍被 xAI 拒绝。"
+        "CF Worker 可勾选多个已绑定域名：固定 / 随机 / 轮换，减轻单域风控。"
     )
+    cf_domain = str(c.get("cfworker_domain") or c.get("defaultDomains") or "").strip()
+    cf_domains = _parse_domain_list(c.get("cfworker_domains") or c.get("defaultDomains") or cf_domain)
+    cf_enabled = _parse_domain_list(c.get("cfworker_enabled_domains") or cf_domains or cf_domain)
+    if not cf_enabled and cf_domain:
+        cf_enabled = _parse_domain_list(cf_domain)
+    if not cf_domains and cf_enabled:
+        cf_domains = list(cf_enabled)
+    cf_mode = _cfworker_domain_mode(c.get("cfworker_domain_mode"))
+    # keep preferred domain coherent
+    if cf_domain:
+        cf_domain = _normalize_domain_name(cf_domain)
+    elif cf_enabled:
+        cf_domain = cf_enabled[0]
     return {
         "provider": provider,
         "choices": choices,
@@ -1470,7 +1769,10 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
         # generic / cfworker / cloudflare
         "cfworker_api_url": str(c.get("cfworker_api_url") or c.get("cloudflare_api_base") or "").strip(),
         "cfworker_admin_token": str(c.get("cfworker_admin_token") or c.get("cloudflare_api_key") or "").strip(),
-        "cfworker_domain": str(c.get("cfworker_domain") or c.get("defaultDomains") or "").strip(),
+        "cfworker_domain": cf_domain,
+        "cfworker_domains": cf_domains,
+        "cfworker_enabled_domains": cf_enabled,
+        "cfworker_domain_mode": cf_mode,
         "cfworker_custom_auth": str(c.get("cfworker_custom_auth") or "").strip(),
         "cfworker_subdomain": str(c.get("cfworker_subdomain") or "").strip(),
         "custom_api_base": str(c.get("cloudflare_api_base") or c.get("cfworker_api_url") or "").strip(),
@@ -1516,13 +1818,25 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
             c.get("gmail_imap_folders") or "INBOX,Spam,[Gmail]/Spam"
         ).strip(),
         "gmail_forward_local_len": str(c.get("gmail_forward_local_len") or "10").strip(),
+        "catchmail_api_base": str(c.get("catchmail_api_base") or "https://api.catchmail.io").strip(),
+        "catchmail_domain": str(c.get("catchmail_domain") or "catchmail.io").strip(),
+        "catchmail_local_len": str(c.get("catchmail_local_len") or "10").strip(),
+        "mailtm_api_base": str(c.get("mailtm_api_base") or "https://api.mail.tm").strip(),
+        "mailtm_domain": str(c.get("mailtm_domain") or "").strip(),
+        "mailtm_local_len": str(c.get("mailtm_local_len") or "10").strip(),
         "skymail_api_base": str(c.get("skymail_api_base") or "https://api.skymail.ink").strip(),
         "skymail_token": str(c.get("skymail_token") or "").strip(),
         "skymail_domain": str(c.get("skymail_domain") or "").strip(),
-        "cloudmail_api_base": str(c.get("cloudmail_api_base") or "").strip(),
+        "cloudmail_api_base": str(
+            c.get("cloudmail_api_base") or c.get("cloudmail_url") or ""
+        ).strip(),
         "cloudmail_admin_email": str(c.get("cloudmail_admin_email") or "").strip(),
-        "cloudmail_admin_password": str(c.get("cloudmail_admin_password") or "").strip(),
-        "cloudmail_domain": str(c.get("cloudmail_domain") or "").strip(),
+        "cloudmail_admin_password": str(
+            c.get("cloudmail_admin_password") or c.get("cloudmail_password") or ""
+        ).strip(),
+        "cloudmail_domain": str(
+            c.get("cloudmail_domain") or c.get("defaultDomains") or ""
+        ).strip(),
         "freemail_api_url": str(c.get("freemail_api_url") or "").strip(),
         "freemail_admin_token": str(c.get("freemail_admin_token") or "").strip(),
         "freemail_domain": str(c.get("freemail_domain") or "").strip(),
@@ -1549,11 +1863,17 @@ def apply_email_config_from_ui(data: dict) -> dict:
 
     if provider in ("domain_forward", "spaceship_forward", "gmail_catchall", "catchall"):
         provider = "gmail_forward"
+    if provider in ("catchmail.io", "catch_mail"):
+        provider = "catchmail"
+    if provider in ("mail.tm", "mail_tm", "mail-tm"):
+        provider = "mailtm"
+    if provider in ("chat", "chatmail", "cloud-mail", "maillab"):
+        provider = "cloudmail"
 
     valid = {
         "cfworker", "cloudflare", "moemail", "tempmail_lol", "duckmail", "gptmail",
-        "maliapi", "luckmail", "mailnest", "gmail_forward", "skymail", "cloudmail",
-        "freemail", "opentrashmail", "laoudo",
+        "maliapi", "luckmail", "mailnest", "gmail_forward", "catchmail", "mailtm", "skymail",
+        "cloudmail", "freemail", "opentrashmail", "laoudo",
     }
     if provider not in valid:
         raise ValueError(f"不支持的邮箱源: {provider}")
@@ -1568,9 +1888,42 @@ def apply_email_config_from_ui(data: dict) -> dict:
     # always store fields (so switching providers keeps values)
     cfg["cfworker_api_url"] = g("cfworker_api_url") or g("custom_api_base")
     cfg["cfworker_admin_token"] = g("cfworker_admin_token") or g("custom_api_key")
-    cfg["cfworker_domain"] = g("cfworker_domain") or g("custom_domain")
     cfg["cfworker_custom_auth"] = g("cfworker_custom_auth")
     cfg["cfworker_subdomain"] = g("cfworker_subdomain")
+
+    # multi-domain pool for CF worker (panel can switch without redeploy)
+    domains_raw = data.get("cfworker_domains", cfg.get("cfworker_domains"))
+    enabled_raw = data.get("cfworker_enabled_domains", cfg.get("cfworker_enabled_domains"))
+    cf_domains = _parse_domain_list(domains_raw)
+    cf_enabled = _parse_domain_list(enabled_raw)
+    preferred = _normalize_domain_name(g("cfworker_domain") or g("custom_domain"))
+    if preferred and preferred not in cf_domains:
+        cf_domains.append(preferred)
+    if not cf_enabled:
+        cf_enabled = list(cf_domains) if cf_domains else ([preferred] if preferred else [])
+    # only keep enabled that exist in pool (or keep all if pool empty)
+    if cf_domains:
+        allowed = set(cf_domains)
+        cf_enabled = [d for d in cf_enabled if d in allowed] or list(cf_domains)
+    if preferred and preferred in cf_enabled:
+        cf_domain = preferred
+    elif preferred and preferred in cf_domains:
+        # preferred not enabled — still allow fixed prefer if user typed it
+        cf_domain = preferred
+        if preferred not in cf_enabled:
+            cf_enabled.insert(0, preferred)
+    elif cf_enabled:
+        cf_domain = cf_enabled[0]
+    else:
+        cf_domain = preferred
+    domain_mode = _cfworker_domain_mode(data.get("cfworker_domain_mode", cfg.get("cfworker_domain_mode")))
+    cfg["cfworker_domains"] = cf_domains
+    cfg["cfworker_enabled_domains"] = cf_enabled
+    cfg["cfworker_domain_mode"] = domain_mode
+    cfg["cfworker_domain"] = cf_domain
+    # rotate state lives under data/ so multi-process round-robin works
+    rotate_path = BASE_DIR / "data" / "cfworker_domain_rotate.json"
+    cfg["cfworker_rotate_state_path"] = str(rotate_path)
 
     # cloudflare_temp_email legacy keys
     cfg["cloudflare_api_base"] = g("custom_api_base") or g("cfworker_api_url")
@@ -1579,7 +1932,7 @@ def apply_email_config_from_ui(data: dict) -> dict:
     if mode not in ("none", "bearer", "x-api-key", "x-admin-auth", "query-key"):
         mode = "x-admin-auth"
     cfg["cloudflare_auth_mode"] = "auth" if mode == "bearer" else mode
-    cfg["defaultDomains"] = g("custom_domain") or g("cfworker_domain")
+    cfg["defaultDomains"] = cf_domain or g("custom_domain")
     cfg["cloudflare_path_accounts"] = g("custom_path_accounts", "/admin/new_address") or "/admin/new_address"
     cfg["cloudflare_path_messages"] = g("custom_path_messages", "/api/mails") or "/api/mails"
     cfg["cloudflare_path_token"] = g("custom_path_token", "/api/token") or "/api/token"
@@ -1593,14 +1946,35 @@ def apply_email_config_from_ui(data: dict) -> dict:
         "mailnest_base_url", "mailnest_api_key", "mailnest_project_code", "mailnest_sale_mode",
         "gmail_forward_domain", "gmail_imap_user", "gmail_imap_password",
         "gmail_imap_host", "gmail_imap_port", "gmail_imap_folders", "gmail_forward_local_len",
+        "catchmail_api_base", "catchmail_domain", "catchmail_local_len",
+        "mailtm_api_base", "mailtm_domain", "mailtm_local_len",
         "skymail_api_base", "skymail_token", "skymail_domain",
-        "cloudmail_api_base", "cloudmail_admin_email", "cloudmail_admin_password", "cloudmail_domain",
+        "cloudmail_api_base", "cloudmail_url", "cloudmail_admin_email",
+        "cloudmail_admin_password", "cloudmail_password", "cloudmail_domain",
         "freemail_api_url", "freemail_admin_token", "freemail_domain",
         "opentrashmail_api_url", "opentrashmail_domain", "opentrashmail_password",
         "laoudo_auth", "laoudo_email", "laoudo_account_id",
     ):
         if key in data or key in cfg:
             cfg[key] = g(key, cfg.get(key, ""))
+
+    # defaults for catchmail
+    if not cfg.get("catchmail_api_base"):
+        cfg["catchmail_api_base"] = "https://api.catchmail.io"
+    if not cfg.get("catchmail_domain"):
+        cfg["catchmail_domain"] = "catchmail.io"
+    if not cfg.get("mailtm_api_base"):
+        cfg["mailtm_api_base"] = "https://api.mail.tm"
+
+    # cloudmail aliases (maillab / grokRegister-cpa style keys)
+    if cfg.get("cloudmail_api_base") and not cfg.get("cloudmail_url"):
+        cfg["cloudmail_url"] = cfg["cloudmail_api_base"]
+    if cfg.get("cloudmail_url") and not cfg.get("cloudmail_api_base"):
+        cfg["cloudmail_api_base"] = cfg["cloudmail_url"]
+    if cfg.get("cloudmail_admin_password") and not cfg.get("cloudmail_password"):
+        cfg["cloudmail_password"] = cfg["cloudmail_admin_password"]
+    if cfg.get("cloudmail_password") and not cfg.get("cloudmail_admin_password"):
+        cfg["cloudmail_admin_password"] = cfg["cloudmail_password"]
 
     # sync yyds keys for legacy
     if cfg.get("maliapi_api_key") and not cfg.get("yyds_api_key"):
@@ -1613,8 +1987,10 @@ def apply_email_config_from_ui(data: dict) -> dict:
         "luckmail": ["luckmail_api_key"],
         "mailnest": ["mailnest_api_key"],
         "gmail_forward": ["gmail_forward_domain", "gmail_imap_user", "gmail_imap_password"],
+        "catchmail": [],  # public API, no key
+        "mailtm": [],  # public API, no key
         "skymail": ["skymail_token"],
-        "cloudmail": ["cloudmail_api_base"],
+        "cloudmail": ["cloudmail_api_base", "cloudmail_admin_password"],
         "freemail": ["freemail_api_url"],
         "opentrashmail": ["opentrashmail_api_url"],
         "laoudo": ["laoudo_email"],
@@ -1626,6 +2002,10 @@ def apply_email_config_from_ui(data: dict) -> dict:
             if provider == "cfworker" and cfg.get("cloudflare_api_base"):
                 continue
             if provider == "cloudflare" and cfg.get("cfworker_api_url"):
+                continue
+            if provider == "cloudmail" and field == "cloudmail_api_base" and cfg.get("cloudmail_url"):
+                continue
+            if provider == "cloudmail" and field == "cloudmail_admin_password" and cfg.get("cloudmail_password"):
                 continue
             raise ValueError(f"邮箱源 {provider} 需要配置: {field}")
 
@@ -1970,7 +2350,19 @@ def _run_one_round(round_no: int, total: int) -> bool:
             log_line("[!] 内置公共临时邮已移除，请在面板下拉选择其它邮箱源")
             return False
         # no-key providers
-        free_ok = mail_prov in ("tempmail_lol", "moemail", "gptmail", "duckmail")
+        free_ok = mail_prov in (
+            "tempmail_lol",
+            "moemail",
+            "gptmail",
+            "duckmail",
+            "catchmail",
+            "catchmail.io",
+            "catch_mail",
+            "mailtm",
+            "mail.tm",
+            "mail_tm",
+            "mail-tm",
+        )
         has_cf = bool(str(mail_cfg.get("cfworker_api_url") or mail_cfg.get("cloudflare_api_base") or "").strip())
         has_luck = bool(str(mail_cfg.get("luckmail_api_key") or "").strip())
         has_mailnest = bool(str(mail_cfg.get("mailnest_api_key") or "").strip())
@@ -1981,7 +2373,14 @@ def _run_one_round(round_no: int, total: int) -> bool:
         )
         has_mali = bool(str(mail_cfg.get("maliapi_api_key") or mail_cfg.get("yyds_api_key") or "").strip())
         has_sky = bool(str(mail_cfg.get("skymail_token") or "").strip())
-        has_cloud = bool(str(mail_cfg.get("cloudmail_api_base") or "").strip())
+        has_cloud = bool(
+            str(mail_cfg.get("cloudmail_api_base") or mail_cfg.get("cloudmail_url") or "").strip()
+            and str(
+                mail_cfg.get("cloudmail_admin_password")
+                or mail_cfg.get("cloudmail_password")
+                or ""
+            ).strip()
+        )
         has_free = bool(str(mail_cfg.get("freemail_api_url") or "").strip())
         has_otm = bool(str(mail_cfg.get("opentrashmail_api_url") or "").strip())
         has_lao = bool(str(mail_cfg.get("laoudo_email") or "").strip())
@@ -1994,6 +2393,10 @@ def _run_one_round(round_no: int, total: int) -> bool:
             ok = has_mailnest
         elif mail_prov in ("gmail_forward", "domain_forward", "spaceship_forward", "gmail_catchall"):
             ok = has_gmail_fwd
+        elif mail_prov in ("catchmail", "catchmail.io", "catch_mail"):
+            ok = True
+        elif mail_prov in ("mailtm", "mail.tm", "mail_tm", "mail-tm"):
+            ok = True
         elif mail_prov in ("maliapi", "yyds"):
             ok = has_mali
         elif mail_prov == "skymail":
@@ -2522,8 +2925,15 @@ INDEX_HTML = r"""
         </label>
       </div>
       <div class="row" style="margin-top:8px">
-        <label>域名
-          <input type="text" id="cfworker_domain" placeholder="mail.example.com"/>
+        <label style="flex:1.2">切换模式
+          <select id="cfworker_domain_mode" title="fixed=只用首选; random=随机; rotate=轮换">
+            <option value="fixed">固定首选域名</option>
+            <option value="random">随机（勾选池）</option>
+            <option value="rotate">轮换（勾选池）</option>
+          </select>
+        </label>
+        <label>首选域名
+          <input type="text" id="cfworker_domain" placeholder="点击下方域名或手填"/>
         </label>
         <label>站点密码
           <input type="password" id="cfworker_custom_auth" placeholder="可选"/>
@@ -2531,6 +2941,18 @@ INDEX_HTML = r"""
         <label>子域名
           <input type="text" id="cfworker_subdomain" placeholder="可选"/>
         </label>
+      </div>
+      <div style="margin-top:10px;padding:10px 12px;border:1px solid #2a3a55;border-radius:10px;background:rgba(20,30,50,.35)">
+        <div class="row" style="align-items:center;gap:10px;margin:0">
+          <div class="muted" style="flex:1;font-size:12px;line-height:1.5">
+            已绑定 CF 域名池：勾选启用，点域名设为首选。Worker 白名单里有的才能建号；新域仍需 deploy + catch-all。
+          </div>
+          <button type="button" class="btn" onclick="refreshCfworkerDomains()">从 Worker 拉取域名</button>
+          <button type="button" class="btn" onclick="selectAllCfDomains(true)">全选</button>
+          <button type="button" class="btn" onclick="selectAllCfDomains(false)">全不选</button>
+        </div>
+        <div id="cfworker_domain_list" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px"></div>
+        <div id="cfworker_domain_status" class="muted" style="font-size:12px;margin-top:8px"></div>
       </div>
     </div>
 
@@ -2713,6 +3135,42 @@ INDEX_HTML = r"""
       </div>
     </div>
 
+    <div id="box_catchmail" class="mail-box" style="display:none;margin-top:10px">
+      <div class="muted" style="margin-bottom:8px;font-size:12px">
+        Catchmail.io 公开临时邮：无需注册/API Key。默认用 <code>@catchmail.io</code> 随机别名收 xAI 验证码。
+        自有域名需把 MX 指到 <code>smtp.catchmail.io</code>。公共源可能被 xAI 拒收，稳了再用。
+      </div>
+      <div class="row">
+        <label style="flex:2">API Base
+          <input type="text" id="catchmail_api_base" placeholder="https://api.catchmail.io"/>
+        </label>
+        <label>域名
+          <input type="text" id="catchmail_domain" placeholder="catchmail.io"/>
+        </label>
+        <label style="max-width:110px">别名长度
+          <input type="text" id="catchmail_local_len" placeholder="10"/>
+        </label>
+      </div>
+    </div>
+
+    <div id="box_mailtm" class="mail-box" style="display:none;margin-top:10px">
+      <div class="muted" style="margin-bottom:8px;font-size:12px">
+        mail.tm 公开临时邮：无 API Key。先 <code>GET /domains</code> 再随机创建账号收信。
+        和 catchmail 一样，公共域名可能被 xAI 拒注册码/OAuth，仅作备选。
+      </div>
+      <div class="row">
+        <label style="flex:2">API Base
+          <input type="text" id="mailtm_api_base" placeholder="https://api.mail.tm"/>
+        </label>
+        <label>固定域名（可空）
+          <input type="text" id="mailtm_domain" placeholder="留空=自动选可用域"/>
+        </label>
+        <label style="max-width:110px">别名长度
+          <input type="text" id="mailtm_local_len" placeholder="10"/>
+        </label>
+      </div>
+    </div>
+
     <div id="box_skymail" class="mail-box" style="display:none;margin-top:10px">
       <div class="row">
         <label style="flex:2">API Base
@@ -2728,20 +3186,24 @@ INDEX_HTML = r"""
     </div>
 
     <div id="box_cloudmail" class="mail-box" style="display:none;margin-top:10px">
+      <div class="muted" style="margin-bottom:8px;font-size:12px">
+        对接 grokRegister-cpa 的 CloudMail（maillab/cloud-mail）：管理员创建随机地址 + 公开接口收信。
+        URL 填站点根（不要带 /api）。也兼容配置键 cloudmail_url / cloudmail_password。
+      </div>
       <div class="row">
-        <label style="flex:2">API Base
-          <input type="text" id="cloudmail_api_base"/>
+        <label style="flex:2">CloudMail URL
+          <input type="text" id="cloudmail_api_base" placeholder="https://mail.example.com"/>
         </label>
         <label>管理员邮箱
-          <input type="text" id="cloudmail_admin_email"/>
+          <input type="text" id="cloudmail_admin_email" placeholder="admin@example.com"/>
         </label>
         <label>管理员密码
           <input type="password" id="cloudmail_admin_password"/>
         </label>
       </div>
       <div class="row" style="margin-top:8px">
-        <label>域名
-          <input type="text" id="cloudmail_domain"/>
+        <label style="flex:2">收信域名（可多个，逗号分隔）
+          <input type="text" id="cloudmail_domain" placeholder="example.com,mail.example.com"/>
         </label>
       </div>
     </div>
@@ -2861,6 +3323,75 @@ function onEmailProviderChange(){
 function _val(id){const el=document.getElementById(id); return el?el.value:'';}
 function _set(id,v){const el=document.getElementById(id); if(el) el.value=v||'';}
 function _check(id,v){const el=document.getElementById(id); if(el) el.checked=!!v;}
+let _cfDomainPool=[];
+let _cfEnabledSet=new Set();
+function _normDom(d){return String(d||'').trim().toLowerCase().replace(/^@/,'');}
+function setCfDomainStatus(msg){const el=document.getElementById('cfworker_domain_status'); if(el) el.textContent=msg||'';}
+function renderCfDomainList(){
+  const box=document.getElementById('cfworker_domain_list');
+  if(!box) return;
+  box.innerHTML='';
+  const preferred=_normDom(_val('cfworker_domain'));
+  if(!_cfDomainPool.length){
+    box.innerHTML='<span class="muted" style="font-size:12px">还没有域名。点「从 Worker 拉取域名」，或先在首选域名手填后保存。</span>';
+    return;
+  }
+  _cfDomainPool.forEach(dom=>{
+    const wrap=document.createElement('label');
+    wrap.style.cssText='display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid #2a3a55;border-radius:999px;background:rgba(0,0,0,.2);cursor:pointer;font-size:12px';
+    if(preferred===dom) wrap.style.borderColor='#3d8bfd';
+    const cb=document.createElement('input');
+    cb.type='checkbox'; cb.value=dom; cb.checked=_cfEnabledSet.has(dom);
+    cb.onchange=()=>{ if(cb.checked) _cfEnabledSet.add(dom); else _cfEnabledSet.delete(dom); };
+    const txt=document.createElement('span');
+    txt.textContent=dom + (preferred===dom ? ' · 首选' : '');
+    txt.title='点击设为首选域名';
+    txt.onclick=(ev)=>{ ev.preventDefault(); _set('cfworker_domain', dom); if(!_cfEnabledSet.has(dom)){ _cfEnabledSet.add(dom);} renderCfDomainList(); };
+    wrap.appendChild(cb); wrap.appendChild(txt); box.appendChild(wrap);
+  });
+  setCfDomainStatus('池 '+_cfDomainPool.length+' · 启用 '+_cfEnabledSet.size+' · 模式 '+(_val('cfworker_domain_mode')||'fixed')+' · 首选 '+(preferred||'-'));
+}
+function selectAllCfDomains(on){
+  _cfEnabledSet = on ? new Set(_cfDomainPool) : new Set();
+  renderCfDomainList();
+}
+function applyCfDomainsFromConfig(e){
+  const pool = Array.isArray(e.cfworker_domains) ? e.cfworker_domains : String(e.cfworker_domains||'').split(/[\s,;|]+/).filter(Boolean);
+  const enabled = Array.isArray(e.cfworker_enabled_domains) ? e.cfworker_enabled_domains : String(e.cfworker_enabled_domains||'').split(/[\s,;|]+/).filter(Boolean);
+  _cfDomainPool = [...new Set(pool.map(_normDom).filter(Boolean))];
+  let en = enabled.map(_normDom).filter(Boolean);
+  if(!en.length && e.cfworker_domain) en=[_normDom(e.cfworker_domain)];
+  if(!_cfDomainPool.length && en.length) _cfDomainPool=[...en];
+  _cfEnabledSet = new Set(en.length ? en : _cfDomainPool);
+  _set('cfworker_domain_mode', e.cfworker_domain_mode||'fixed');
+  renderCfDomainList();
+}
+async function refreshCfworkerDomains(){
+  try{
+    setCfDomainStatus('拉取中…');
+    const body={
+      api_url: _val('cfworker_api_url'),
+      admin_token: _val('cfworker_admin_token'),
+      custom_auth: _val('cfworker_custom_auth')
+    };
+    const j=await api('/api/config/email/cfworker-domains',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const list=(j.domains||[]).map(_normDom).filter(Boolean);
+    if(!list.length) throw new Error('Worker 返回空域名列表（确认 DOMAINS 已 deploy）');
+    // merge, keep previous enabled if still present
+    const prevEnabled = new Set([..._cfEnabledSet]);
+    _cfDomainPool = [...new Set(list)];
+    _cfEnabledSet = new Set(_cfDomainPool.filter(d=>prevEnabled.has(d)));
+    if(!_cfEnabledSet.size) _cfEnabledSet = new Set(_cfDomainPool);
+    const preferred=_normDom(_val('cfworker_domain'));
+    if(preferred && _cfDomainPool.includes(preferred) && !_cfEnabledSet.has(preferred)) _cfEnabledSet.add(preferred);
+    if(!preferred && _cfDomainPool.length) _set('cfworker_domain', _cfDomainPool[0]);
+    renderCfDomainList();
+    toast('已拉取 '+_cfDomainPool.length+' 个域名');
+  }catch(err){
+    setCfDomainStatus('拉取失败: '+err.message);
+    toast('拉取域名失败: '+err.message);
+  }
+}
 async function loadEmailConfig(){
   try{
     const j=await api('/api/config/email');
@@ -2881,6 +3412,7 @@ async function loadEmailConfig(){
     _set('cfworker_domain', e.cfworker_domain);
     _set('cfworker_custom_auth', e.cfworker_custom_auth);
     _set('cfworker_subdomain', e.cfworker_subdomain);
+    applyCfDomainsFromConfig(e);
     _set('custom_api_base', e.custom_api_base);
     _set('custom_api_key', e.custom_api_key);
     _set('custom_auth_mode', e.custom_auth_mode||'x-admin-auth');
@@ -2916,6 +3448,12 @@ async function loadEmailConfig(){
     _set('gmail_imap_port', e.gmail_imap_port||'993');
     _set('gmail_imap_folders', e.gmail_imap_folders||'INBOX,Spam,[Gmail]/Spam');
     _set('gmail_forward_local_len', e.gmail_forward_local_len||'10');
+    _set('catchmail_api_base', e.catchmail_api_base||'https://api.catchmail.io');
+    _set('catchmail_domain', e.catchmail_domain||'catchmail.io');
+    _set('catchmail_local_len', e.catchmail_local_len||'10');
+    _set('mailtm_api_base', e.mailtm_api_base||'https://api.mail.tm');
+    _set('mailtm_domain', e.mailtm_domain||'');
+    _set('mailtm_local_len', e.mailtm_local_len||'10');
     _set('skymail_api_base', e.skymail_api_base||'https://api.skymail.ink');
     _set('skymail_token', e.skymail_token);
     _set('skymail_domain', e.skymail_domain);
@@ -2945,6 +3483,9 @@ async function saveEmailConfig(){
     cfworker_api_url: _val('cfworker_api_url'),
     cfworker_admin_token: _val('cfworker_admin_token'),
     cfworker_domain: _val('cfworker_domain'),
+    cfworker_domains: _cfDomainPool.slice(),
+    cfworker_enabled_domains: [..._cfEnabledSet],
+    cfworker_domain_mode: _val('cfworker_domain_mode')||'fixed',
     cfworker_custom_auth: _val('cfworker_custom_auth'),
     cfworker_subdomain: _val('cfworker_subdomain'),
     custom_api_base: _val('custom_api_base'),
@@ -2982,6 +3523,12 @@ async function saveEmailConfig(){
     gmail_imap_port: _val('gmail_imap_port')||'993',
     gmail_imap_folders: _val('gmail_imap_folders')||'INBOX,Spam,[Gmail]/Spam',
     gmail_forward_local_len: _val('gmail_forward_local_len')||'10',
+    catchmail_api_base: _val('catchmail_api_base')||'https://api.catchmail.io',
+    catchmail_domain: _val('catchmail_domain')||'catchmail.io',
+    catchmail_local_len: _val('catchmail_local_len')||'10',
+    mailtm_api_base: _val('mailtm_api_base')||'https://api.mail.tm',
+    mailtm_domain: _val('mailtm_domain'),
+    mailtm_local_len: _val('mailtm_local_len')||'10',
     skymail_api_base: _val('skymail_api_base'),
     skymail_token: _val('skymail_token'),
     skymail_domain: _val('skymail_domain'),
@@ -3829,6 +4376,24 @@ def api_set_email_config():
     return jsonify({"ok": True, "message": "邮箱设置已保存", "email": email})
 
 
+@app.post("/api/config/email/cfworker-domains")
+def api_fetch_cfworker_domains():
+    need = require_login()
+    if need:
+        return need
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        info = fetch_cfworker_domains(
+            api_url=str(data.get("api_url") or "").strip(),
+            admin_token=str(data.get("admin_token") or "").strip(),
+            custom_auth=str(data.get("custom_auth") or "").strip(),
+            proxy=str(data.get("proxy") or "").strip(),
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    return jsonify({"ok": True, **info})
+
+
 @app.get("/api/job/status")
 def api_job_status():
     need = require_login()
@@ -3878,10 +4443,22 @@ def api_sub2_groups():
     need = require_login()
     if need:
         return need
+    force = str(request.args.get("force") or "").strip().lower() in ("1", "true", "yes")
+    stale = False
+    err = ""
     try:
-        groups = sub2_list_groups()
+        groups = sub2_list_groups(force=force)
+        # if we only have cache and it's old, mark stale for UI but still 200
+        with _sub2_lock:
+            age = time.time() - float(_sub2_groups_cache.get("at") or 0)
+            ttl = float(_sub2_groups_cache.get("ttl") or 45)
+        stale = age > ttl
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e), "sub2": sub2_status()}), 502
+        err = str(e)
+        groups = list(_sub2_groups_cache.get("groups") or [])
+        if not groups:
+            return jsonify({"ok": False, "error": err, "sub2": sub2_status()}), 502
+        stale = True
     out = []
     for g in groups:
         if not isinstance(g, dict):
@@ -3908,6 +4485,8 @@ def api_sub2_groups():
         {
             "ok": True,
             "groups": out,
+            "stale": bool(stale),
+            "error": err,
             "target_group_id": st.get("target_group_id") or 0,
             "target_group_name": st.get("target_group_name") or "",
             "sub2": st,

@@ -19,10 +19,18 @@ const (
 )
 
 // OpenAIOAuth429FailoverState tracks the request-local follow-up budget after
-// the first Grok OAuth 429. Once that 429 occurs, exactly one different account
-// may be attempted; any failure from that follow-up account ends failover.
+// Grok OAuth 429s.
+//
+// RPM-style 429s only get a short follow-up budget so a pool-wide RPM storm
+// does not walk hundreds of accounts. Free-usage-exhausted (daily 1M window)
+// must keep switching — those accounts are parked ~24h and siblings usually
+// still have quota.
 type OpenAIOAuth429FailoverState struct {
 	grokOAuth429FollowupPending bool
+	// freeUsageExhaustedSeen means at least one account hit the free daily
+	// window; do not apply the one-followup early stop for the rest of this
+	// request.
+	freeUsageExhaustedSeen bool
 }
 
 func openAIAccountStateContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -323,12 +331,27 @@ func (s *OpenAIGatewayService) isOpenAIOAuth429Storm() bool {
 	return s.openaiOAuth429WindowCount.Load() >= openAIOAuth429StormThreshold
 }
 
-func (s *OpenAIGatewayService) ShouldStopOpenAIOAuth429Failover(account *Account, statusCode int, failedSwitches int, state *OpenAIOAuth429FailoverState) bool {
+func (s *OpenAIGatewayService) ShouldStopOpenAIOAuth429Failover(account *Account, statusCode int, failedSwitches int, state *OpenAIOAuth429FailoverState, responseBody ...[]byte) bool {
+	var body []byte
+	if len(responseBody) > 0 {
+		body = responseBody[0]
+	}
+	freeUsage := statusCode == http.StatusTooManyRequests && isGrokFreeUsageExhaustedBody(body)
+	if freeUsage && state != nil {
+		state.freeUsageExhaustedSeen = true
+		// Daily free window: keep walking the pool; each hit parks that account ~24h.
+		return false
+	}
+	if state != nil && state.freeUsageExhaustedSeen {
+		// Once free-usage exhaustion is in play for this request, never apply the
+		// RPM one-followup stop — keep switching until maxAccountSwitches.
+		return false
+	}
 	if failedSwitches < openAIOAuth429StormMaxAccountSwitches {
 		return false
 	}
 	if state != nil && state.grokOAuth429FollowupPending {
-		// The follow-up budget was armed by a Grok OAuth 429. Consume it on
+		// The follow-up budget was armed by a Grok OAuth RPM 429. Consume it on
 		// any failing follow-up account, even if a mixed pool selected an API-key
 		// account next.
 		return true

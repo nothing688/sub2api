@@ -22,6 +22,19 @@ sys.path.insert(0, str(ROOT / "lib"))
 
 from sso2cpa_core import build_sub2_payload, cpa_to_sub2_account  # noqa: E402
 
+# Windows system proxy (Clash) hijacks loopback Sub2 → intermittent 502 on push.
+_no_proxy_bits = [
+    x.strip()
+    for x in str(os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "").split(",")
+    if x.strip()
+]
+for _host in ("127.0.0.1", "localhost", "::1", "sub2api", "sub2api.local"):
+    if _host not in _no_proxy_bits:
+        _no_proxy_bits.append(_host)
+os.environ["NO_PROXY"] = ",".join(_no_proxy_bits)
+os.environ["no_proxy"] = os.environ["NO_PROXY"]
+_SUB2_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 CPA_DIR = Path(os.environ.get("CPA_DIR", str(ROOT / "data" / "cpa"))).resolve()
 STATE_PATH = Path(os.environ.get("SUB2_PUSH_STATE", str(ROOT / "data" / "sub2_push_state.json")))
 CONFIG_PATH = ROOT / "config.json"
@@ -104,7 +117,7 @@ def auth_headers(st: dict) -> dict:
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with _SUB2_OPENER.open(req, timeout=30) as resp:
         obj = json.loads(resp.read().decode("utf-8", errors="replace"))
     data = obj.get("data") if isinstance(obj, dict) and isinstance(obj.get("data"), dict) else obj
     token = ""
@@ -120,21 +133,63 @@ def auth_headers(st: dict) -> dict:
     return h
 
 
-def http_json(method: str, url: str, headers: dict, payload=None, timeout=60):
+def http_json(method: str, url: str, headers: dict, payload=None, timeout=60, retries=4):
     data = None
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            code = resp.status
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
-        raise RuntimeError(f"HTTP {e.code}: {body[:400]}") from e
-    if not raw:
-        return {"_http": code}
-    return json.loads(raw)
+    last_err = None
+    attempts = max(1, int(retries or 1))
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with _SUB2_OPENER.open(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                code = resp.status
+            if not raw:
+                return {"_http": code}
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                obj["_http"] = code
+            return obj
+        except urllib.error.HTTPError as e:
+            last_err = e
+            body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+            code = int(getattr(e, "code", 0) or 0)
+            if code == 401 and attempt < attempts:
+                _jwt["token"] = ""
+                _jwt["at"] = 0.0
+                # caller may pass stale headers; rebuild if possible via side channel
+                time.sleep(0.4)
+                continue
+            if code in (408, 425, 429, 500, 502, 503, 504) and attempt < attempts:
+                sleep_s = min(12.0, 0.8 * (2 ** (attempt - 1)))
+                log(f"transient HTTP {code} {method} attempt={attempt}/{attempts}, sleep {sleep_s:.1f}s")
+                time.sleep(sleep_s)
+                continue
+            raise RuntimeError(f"HTTP {code}: {body[:400]}") from e
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            transient = any(
+                x in msg
+                for x in (
+                    "timed out",
+                    "timeout",
+                    "bad gateway",
+                    "connection reset",
+                    "connection aborted",
+                    "10054",
+                    "10053",
+                    "temporarily",
+                )
+            ) or isinstance(e, (TimeoutError, urllib.error.URLError, ConnectionError, OSError))
+            if transient and attempt < attempts:
+                sleep_s = min(12.0, 0.8 * (2 ** (attempt - 1)))
+                log(f"transient err attempt={attempt}/{attempts}: {e}; sleep {sleep_s:.1f}s")
+                time.sleep(sleep_s)
+                continue
+            raise
+    raise RuntimeError(f"{method} {url} failed after retries: {last_err}")
 
 
 def find_account_id(st: dict, headers: dict, email: str):
@@ -237,18 +292,51 @@ def push_one(path: Path, st: dict) -> tuple[bool, str]:
             creds.pop(junk, None)
         acc["credentials"] = creds
 
-    headers = auth_headers(st)
-    body = {
-        "data": payload,
-        "skip_default_group_bind": bool(st["group_id"] > 0),
-    }
-    obj = http_json(
-        "POST",
-        f"{st['base']}/api/v1/admin/accounts/data",
-        headers,
-        body,
-        timeout=60,
-    )
+    # rebuild auth each attempt so 401/JWT refresh works
+    last_push_err = None
+    obj = None
+    for attempt in range(1, 5):
+        try:
+            headers = auth_headers(st)
+            body = {
+                "data": payload,
+                "skip_default_group_bind": bool(st["group_id"] > 0),
+            }
+            obj = http_json(
+                "POST",
+                f"{st['base']}/api/v1/admin/accounts/data",
+                headers,
+                body,
+                timeout=90,
+                retries=1,  # outer loop already retries; keep single attempt here
+            )
+            last_push_err = None
+            break
+        except Exception as e:
+            last_push_err = e
+            msg_l = str(e).lower()
+            if "401" in msg_l or "unauthorized" in msg_l:
+                _jwt["token"] = ""
+                _jwt["at"] = 0.0
+            if attempt >= 4:
+                break
+            sleep_s = min(8.0, 0.6 * (2 ** (attempt - 1)))
+            log(f"push retry {attempt}/4 for {email or path.name}: {e}; sleep {sleep_s:.1f}s")
+            time.sleep(sleep_s)
+    if last_push_err is not None:
+        # maybe already imported by panel
+        try:
+            headers = auth_headers(st)
+            aid = find_account_id(st, headers, email)
+            if aid:
+                bind_msg = ""
+                if st["group_id"] > 0:
+                    bind_msg = " " + bind_group(st, headers, aid, st["group_id"])
+                return True, f"recovered_existing account_id={aid} after_err={last_push_err}{bind_msg}"
+        except Exception:
+            pass
+        return False, str(last_push_err)
+
     data = obj.get("data") if isinstance(obj, dict) and isinstance(obj.get("data"), dict) else obj
     created = failed = 0
     if isinstance(data, dict):
@@ -257,6 +345,7 @@ def push_one(path: Path, st: dict) -> tuple[bool, str]:
     msg = f"created={created} failed={failed}"
     # already exists still counts as success if no hard fail
     time.sleep(1.0)
+    headers = auth_headers(st)
     aid = find_account_id(st, headers, email)
     bind_msg = ""
     if aid and st["group_id"] > 0:

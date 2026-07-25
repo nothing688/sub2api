@@ -1023,10 +1023,40 @@ func grokRateLimitResetAt(snapshot *xai.QuotaSnapshot, now time.Time) (time.Time
 	return time.Time{}, false
 }
 
+func isGrokFreeUsageExhaustedSnapshot(snapshot *xai.QuotaSnapshot) bool {
+	if snapshot == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(snapshot.ObservationSource), "free_usage_exhausted_body") {
+		return true
+	}
+	// Tokens hard-zero with a multi-hour reset is the free daily window, not RPM.
+	if snapshot.Tokens != nil && snapshot.Tokens.Remaining != nil && *snapshot.Tokens.Remaining <= 0 {
+		candidate := time.Time{}
+		if snapshot.Tokens.ResetUnix != nil && *snapshot.Tokens.ResetUnix > 0 {
+			candidate = time.Unix(*snapshot.Tokens.ResetUnix, 0)
+		} else if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(snapshot.Tokens.ResetAt)); err == nil {
+			candidate = parsed
+		}
+		if !candidate.IsZero() && candidate.After(time.Now().Add(30*time.Minute)) {
+			return true
+		}
+	}
+	return false
+}
+
 func grokRateLimitResetAtForAccount(account *Account, snapshot *xai.QuotaSnapshot, now time.Time) (time.Time, bool) {
 	resetAt, limited := grokRateLimitResetAt(snapshot, now)
 	if !limited {
 		return resetAt, limited
+	}
+	// Daily free-usage exhaustion must keep the long rolling window (~24h).
+	// Never clamp these to the short RPM free-pool max.
+	if isGrokFreeUsageExhaustedSnapshot(snapshot) {
+		if !resetAt.After(now.Add(30 * time.Minute)) {
+			resetAt = now.Add(24 * time.Hour)
+		}
+		return resetAt, true
 	}
 	// Free OAuth pool: prefer short cooldown. Only keep a long boundary when the
 	// token/request window is truly exhausted with a far upstream reset. Generic
@@ -1100,10 +1130,12 @@ func normalizeGrokRateLimitResetAt(account *Account, resetAt, now time.Time) tim
 		resetAt = now.Add(fallback)
 	}
 	// Paid/unknown: never shorten an existing longer cooldown.
-	// Free pool: allow shorter resets so RPM 429s do not pin an account for ages
-	// after a later observation shows a nearer retry boundary.
+	// Free pool: allow shorter RPM resets to shrink, but never chop a multi-hour
+	// free-usage window (daily 1M) back down to 30s/2m.
 	if account != nil && account.RateLimitResetAt != nil && account.RateLimitResetAt.After(resetAt) {
 		if !isKnownGrokFreeAccount(account) {
+			resetAt = *account.RateLimitResetAt
+		} else if account.RateLimitResetAt.After(now.Add(grokRateLimitFreeMaxCooldown)) {
 			resetAt = *account.RateLimitResetAt
 		}
 	}
@@ -1193,20 +1225,23 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 	case http.StatusForbidden:
 		s.tempUnscheduleGrok(ctx, account, 30*time.Minute, "grok access or entitlement denied")
 	case http.StatusTooManyRequests:
-		// Free daily window exhausted: pin remaining=0 and hold until rolling reset
-		// (prefer ~24h when body says free-usage-exhausted without a shorter header reset).
+		// Free daily window exhausted: pin remaining=0 / 100% used and hold ~24h.
+		// Must beat short free-RPM clamp so exhausted accounts leave the TopK pool.
 		if isGrokFreeUsageExhaustedBody(responseBody) {
 			resetAt, limited := grokRateLimitResetAtForAccount(account, snapshot, now)
 			if !limited || !resetAt.After(now.Add(30*time.Minute)) {
 				resetAt = now.Add(24 * time.Hour)
 			}
-			// Force token window to zero so UI/scheduler both see exhausted.
 			if snapshot == nil {
 				snapshot = &xai.QuotaSnapshot{StatusCode: statusCode, UpdatedAt: now.UTC().Format(time.RFC3339)}
 			}
 			zero := int64(0)
 			limit := int64(1_000_000)
-			if snapshot.Tokens != nil && snapshot.Tokens.Limit != nil && *snapshot.Tokens.Limit > 0 {
+			if bodySnap := parseGrokFreeUsageExhaustedBody(responseBody, now); bodySnap != nil && bodySnap.Tokens != nil {
+				if bodySnap.Tokens.Limit != nil && *bodySnap.Tokens.Limit > 0 {
+					limit = *bodySnap.Tokens.Limit
+				}
+			} else if snapshot.Tokens != nil && snapshot.Tokens.Limit != nil && *snapshot.Tokens.Limit > 0 {
 				limit = *snapshot.Tokens.Limit
 			}
 			resetUnix := resetAt.Unix()
@@ -1219,10 +1254,20 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 			snapshot.StatusCode = statusCode
 			snapshot.ObservationSource = "free_usage_exhausted_body"
 			snapshot.HeadersObserved = true
+			snapshot.UpdatedAt = now.UTC().Format(time.RFC3339)
+			// Clear short Retry-After so scheduler does not treat this as RPM-only.
+			snapshot.RetryAfterSeconds = nil
 			s.updateGrokUsageSnapshot(ctx, account, snapshot)
+			// Force durable + runtime block to the full free window.
 			s.rateLimitGrok(ctx, account, resetAt)
+			slog.Info("grok_free_usage_exhausted",
+				"account_id", account.ID,
+				"account_name", account.Name,
+				"reset_at", resetAt.UTC(),
+				"token_limit", limit,
+			)
 		}
-		// updateGrokUsageSnapshot installs both runtime and durable rate-limit state.
+		// Non-exhausted 429: updateGrokUsageSnapshot already installed rate-limit state.
 	case http.StatusPaymentRequired:
 		// 402 = spending-limit / no credits. Permanent — auto-disable the account
 		// so it never gets scheduled again. The snapshot was already persisted above.
@@ -1253,6 +1298,12 @@ func isGrokFreeUsageExhaustedBody(body []byte) bool {
 		strings.Contains(low, "free usage limit") ||
 		strings.Contains(low, "free usage has been exhausted") ||
 		(strings.Contains(low, "subscription:") && strings.Contains(low, "free") && strings.Contains(low, "exhausted"))
+}
+
+// IsGrokFreeUsageExhaustedBody is the exported form for handlers that must
+// sanitize client-facing failover responses.
+func IsGrokFreeUsageExhaustedBody(body []byte) bool {
+	return isGrokFreeUsageExhaustedBody(body)
 }
 
 // parseGrokFreeUsageExhaustedBody extracts actual/limit from free-usage-exhausted JSON/text.
