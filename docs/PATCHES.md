@@ -47,11 +47,29 @@ Hard requirements:
 4. `base_url` must be `https://cli-chat-proxy.grok.com/v1`
 5. Device-flow tokens without the claim are rejected
 
-## 4. Admin UX
+## 4. Free-usage exhausted (daily 1M window)
+
+Files:
+- `backend/internal/service/openai_gateway_grok.go`
+  - detect body `subscription:free-usage-exhausted` / tokens actual/limit
+  - pin remaining≈0, observation_source=`free_usage_exhausted_body`
+  - rate_limit_reset_at ≈ +24h (do **not** clamp to free RPM 2m window)
+- `backend/internal/service/openai_account_runtime_block_fastpath.go`
+  - `OpenAIOAuth429FailoverState.freeUsageExhaustedSeen`
+  - free-usage keeps multi-account switching (not early stop after 1–2)
+- handlers (`openai_gateway_handler`, chat/images/media/alpha_search):
+  - pass upstream body into `ShouldStopOpenAIOAuth429Failover`
+  - failover exhausted free-usage/429 → clean client 429 (no raw body / no 503 wrap)
+- tests: `openai_gateway_grok_free_usage_test.go`
+
+Intent: free daily exhaust must cool the account ~24h and rotate pool; clients should see a normal 429, not a gateway 503 storm.
+
+## 5. Admin UX
 
 - Groups route allowed in simple mode
 - Accounts bulk bar: probe dead / delete dead
 - Quick nav links as needed
+- Account page size can load all accounts when needed
 
 ## Rebuild
 

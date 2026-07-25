@@ -69,8 +69,10 @@ CC Switch / Claude Code / 自建 Bot 都按这套接，不用理解 xAI 内部 c
 - [Sub2API Docker 详细教程](#sub2api-docker-详细教程)
 - [代理：必须开穿透 / 虚拟网卡](#代理必须开穿透--虚拟网卡)
 - [注册机面板](#注册机面板)
+- [CF 多域名切换](#cf-多域名切换)
 - [OAuth 硬规则（必读）](#oauth-硬规则必读)
 - [Cloudflare 自建临时邮箱（推荐）](#cloudflare-自建临时邮箱推荐)
+- [免费额度耗尽（free-usage）](#免费额度耗尽free-usage)
 - [死号探测](#死号探测)
 - [CC Switch / Claude Code（OpenAI 格式）](#cc-switch--claude-codeopenai-格式)
 - [代码与 Docker 一致性](#代码与-docker-一致性)
@@ -273,8 +275,10 @@ model    = 分组放行的 grok 模型名
 | 模块 | 能力 |
 |------|------|
 | 注册机 | Camoufox 无头 / Chromium；多邮箱源；birth+TOS 激活；SSO→OAuth |
-| 自动入库 | 授权码换 `grok-build` token，推 Sub2 `type=oauth` |
+| CF 多域名 | 面板 fixed / random / rotate 切换已绑定 CF 域，降域名风控 |
+| 自动入库 | 授权码换 `grok-build` token，推 Sub2 `type=oauth`；**强制直连** `127.0.0.1:18080`（不走系统代理） |
 | Sub2 调度 | 免费号剩余 token 感知、软适配、429 冷却、有空闲号少排队 |
+| free-usage | 日额度耗尽钉 ~24h、继续切号、客户端干净 429（不 503） |
 | 死号 | 管理端批量探测；chat permission-denied 等真死才标死；不误杀 billing 403 |
 | 客户端 | OpenAI 兼容网关，给 CC Switch / Claude Code 用 |
 
@@ -525,12 +529,12 @@ curl https://api.ip.sb/ip
 
 1. 邮箱源：优先 **CF Worker 自建域** / DuckMail；少用公共 temp  
 2. 浏览器：Camoufox 无头（或 Chromium 有头调试）  
-3. 代理：本机 Clash 端口  
-4. Sub2 分组：面板里选中目标组（自动 bind）  
+3. 代理：本机 Clash 端口（**仅**注册/出网；推 Sub2 管理口已强制直连 localhost）  
+4. Sub2 分组：面板里选中目标组（自动 bind，例如 `Grok-new`）  
 5. 开始注册  
 6. 成功标志：
    - 本地 `data/cpa/xai-*.json` 生成  
-   - 日志 `[SUB2] PUSH OK mode=cpa-data`  
+   - 日志 `[SUB2] PUSH OK mode=cpa-data ... bound_group=N`  
    - Sub2 账号列表出现 `oauth` 号  
 
 ### 手动导出（不自动推时）
@@ -554,6 +558,40 @@ curl https://api.ip.sb/ip
 | `GROK_PROXY` | `http://127.0.0.1:7895` | 注册/换票代理 |
 | `GROK_BROWSER_ENGINE` | `camoufox` | 浏览器引擎 |
 | `PANEL_PORT` | `8877` | 面板端口 |
+| `SUB2_HTTP_CONCURRENCY` | `2` | 面板→Sub2 管理 API 并发上限 |
+
+`config.json` 也可写 `auto_sub2_push` / `sub2_import_mode` / `sub2api_*` / `sub2_target_group_*`（面板热读）。
+
+---
+
+## CF 多域名切换
+
+自建 CF Worker 可挂多个收信域。面板在 **邮箱配置** 里支持：
+
+| 字段 | 含义 |
+|------|------|
+| `cfworker_domains` | Worker 白名单域名池（可点「拉取 Worker 域名」） |
+| `cfworker_enabled_domains` | 本次启用子集（勾选） |
+| `cfworker_domain` | fixed 模式的首选域 |
+| `cfworker_domain_mode` | `fixed` / `random` / `rotate` |
+
+```json
+{
+  "email_provider": "cfworker",
+  "cfworker_api_url": "https://mail-api.example.com",
+  "cfworker_admin_token": "你的ADMIN密码",
+  "cfworker_domain": "mail1.example.com",
+  "cfworker_domains": ["mail1.example.com", "mail2.example.com"],
+  "cfworker_enabled_domains": ["mail1.example.com", "mail2.example.com"],
+  "cfworker_domain_mode": "rotate"
+}
+```
+
+- **fixed**：始终用 `cfworker_domain`  
+- **random**：每次建号在 enabled 里随机  
+- **rotate**：轮换，状态文件本地 `data/cfworker_domain_rotate.json`（gitignore）  
+
+新域名要先：Cloudflare Email Routing + Worker `DOMAINS` +（建议）`mail-api.<domain>` 路由。详见 [docs/CF_TEMP_EMAIL.md](docs/CF_TEMP_EMAIL.md)。
 
 ---
 
@@ -603,6 +641,37 @@ curl https://api.ip.sb/ip
 ```
 
 不会部署？把 [docs/CF_TEMP_EMAIL.md](docs/CF_TEMP_EMAIL.md) 里的「让 AI 帮你部署」提示词整段丢给 AI，把域名换成你的即可。
+
+---
+
+## 免费额度耗尽（free-usage）
+
+免费 Grok OAuth 大约 **1M tokens / 滚动 24h**。上游常返回：
+
+```text
+HTTP 429
+subscription:free-usage-exhausted
+tokens (actual/limit)
+```
+
+GrokPool 补丁行为（需 `grokpool-sub2api:local`）：
+
+| 项 | 行为 |
+|----|------|
+| 识别 | body 含 free-usage-exhausted（不只看 Retry-After） |
+| 钉号 | remaining≈0，`observation_source=free_usage_exhausted_body`，`rate_limit_reset_at` ≈ +24h |
+| 切号 | 继续 failover 其它号，**不**在 1–2 次后提前停 |
+| 客户端 | 池耗尽时返回 **干净 429**，不把 raw free-usage 正文 / 503 甩给调用方 |
+| 禁止 | 把日额度耗尽当成 free RPM 只冷却 2 分钟（会反复进 TopK 打爆） |
+
+改完 Go 后必须 rebuild 镜像，**仅 docker cp 二进制** 容器 recreate 会丢：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-sub2api.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\check-parity.ps1
+```
+
+细节：[`docs/PATCHES.md`](docs/PATCHES.md) §4、[`docs/SCHEDULER.md`](docs/SCHEDULER.md)。
 
 ---
 
@@ -790,10 +859,21 @@ GrokPool/
   "browser_engine": "camoufox",
   "enable_nsfw": true,
   "email_provider": "cfworker",
+  "cfworker_domain_mode": "fixed",
+  "cfworker_domains": [],
+  "cfworker_enabled_domains": [],
+  "auto_sub2_push": true,
+  "sub2_import_mode": "cpa-data",
+  "sub2api_base_url": "http://127.0.0.1:18080",
+  "sub2api_admin_email": "admin@sub2api.local",
+  "sub2api_admin_password": "",
+  "sub2_target_group_id": 0,
   "register_count": 1,
   "round_timeout_sec": 480
 }
 ```
+
+完整字段见 `register-win/config.example.json`。
 
 ---
 
@@ -802,20 +882,34 @@ GrokPool/
 **Q: 导入后马上 chat 403？**  
 A: 先看 access_token 是否 `referrer=grok-build`、base_url 是否 cli-chat-proxy。老 device-flow 号直接删掉重导。
 
+**Q: 注册成功但 PUSH 一直 HTTP 502？**  
+A: 常见不是 Sub2 挂了，而是 **Windows 系统代理（Clash）劫持了 `127.0.0.1:18080`**。  
+`urllib.getproxies()` 会把 loopback 管理请求拐去 `789x`，负载高时出现空 body 502；Sub2 容器日志里往往 **没有** 对应 502。  
+当前 panel / `sub2_push_watch` 已对 Sub2 **强制 `ProxyHandler({})` 直连** + `NO_PROXY` 含 localhost。仍 502 时：  
+1) `curl http://127.0.0.1:18080/health` 是否 200  
+2) 确认跑的是本仓库最新 panel  
+3) 看面板日志是 `PUSH OK` 还是仍 `HTTP 502 POST .../accounts/data`
+
 **Q: 注册成功但没有 PUSH OK？**  
-A: 检查 `AUTO_SUB2_PUSH=1`、`SUB2API_ADMIN_PASSWORD`、Sub2 是否 healthy、面板日志 `[SUB2] PUSH FAIL`。
+A: 检查 `auto_sub2_push` / `AUTO_SUB2_PUSH=1`、`sub2api_admin_password`、Sub2 healthy、目标分组已选、日志 `[SUB2] PUSH FAIL`。
+
+**Q: 测试连接报 `GROK_OAUTH_TOKEN_REFRESH_FAILED` / `Refresh token has been revoked`？**  
+A: 这是 **xAI 吊销了 refresh**，不是网关 502。旧 refresh 直刷必挂。若 CPA 文件里 **SSO 还活着**，可走授权码 consent 重拿 token，再 `POST /api/v1/admin/accounts/:id/apply-oauth-credentials` 写回（纯 `accounts/data` 导入常不覆盖已有号）。SSO 也死了只能密码重登或当废号重注册。
+
+**Q: 客户端总 503 / 一堆 free-usage 正文？**  
+A: 升级并 rebuild 含 free-usage 补丁的 `grokpool-sub2api:local`。耗尽号应钉 24h 并切号；failover 尽应干净 429。
 
 **Q: Docker 里还是旧逻辑？**  
-A: 你跑的不是 `grokpool-sub2api:local` 或没 rebuild。执行 `scripts\build-sub2api.ps1` + `check-parity.ps1`。
+A: 你跑的不是 `grokpool-sub2api:local` 或没 rebuild。执行 `scripts\build-sub2api.ps1` + `check-parity.ps1`。仅 `docker cp` 二进制，容器 recreate 会丢。
 
-**Q: 公共临时邮箱一直超时/被拒？**  
-A: 换自建域名邮箱。Gmail 别名无效。
+**Q: 公共临时邮箱一直超时/被拒 / OAuth access_denied？**  
+A: 换自建 CF 域名；面板用 multi-domain rotate 降风控。Gmail 别名对 xAI 注册基本无效。
 
 **Q: CC Switch 应该填 Anthropic 还是 OpenAI？**  
 A: **OpenAI**。Base `http://127.0.0.1:18080/v1`。
 
 **Q: 代理开了系统代理还是不稳？**  
-A: 开 **TUN / 虚拟网卡**，让 Docker 出网也走代理。
+A: 开 **TUN / 虚拟网卡**，让 Docker 出网也走代理。注册走 Clash 端口；**Sub2 本机管理 API 必须直连**。
 
 **Q: 死号按钮点了 deleted=0？**  
 A: 可能只是 unknown/软失败；只有确认 dead 才删。billing 403 不会当死号。
@@ -876,8 +970,10 @@ git status   # 确认没有 .env / token.json
 
 ```text
 改 Go/前端 → build-sub2api.ps1 → check-parity.ps1
-改注册机 Python → 重启 start_worker.bat 即可（无需重建镜像）
+改注册机 Python → 重启 start_worker.bat / panel 即可（无需重建镜像）
+发行到 GitHub main → scripts\promote-to-main.ps1（在 local 提交干净后）
 OAuth 问题 → docs/OAUTH.md
 客户端问题 → docs/CCSWITCH.md
-调度问题 → docs/SCHEDULER.md
+调度 / free-usage → docs/SCHEDULER.md + docs/PATCHES.md
+CF 邮箱 → docs/CF_TEMP_EMAIL.md
 ```

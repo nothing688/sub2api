@@ -44,8 +44,10 @@ MAIL_PROVIDER_CHOICES = [
     ("luckmail", "LuckMail（接码/买邮）"),
     ("mailnest", "MailNest（mailnest.top）"),
     ("gmail_forward", "域名转发→Gmail（无限别名）"),
+    ("catchmail", "Catchmail.io（公开临时邮 API）"),
+    ("mailtm", "mail.tm（公开临时邮 API）"),
     ("skymail", "SkyMail"),
-    ("cloudmail", "CloudMail"),
+    ("cloudmail", "CloudMail（自建 maillab）"),
     ("freemail", "Freemail 自建"),
     ("opentrashmail", "OpenTrashMail"),
     ("laoudo", "Laoudo 固定邮箱"),
@@ -75,6 +77,15 @@ def normalize_provider(name: str) -> str:
         "tempmail.lol": "tempmail_lol",
         "yyds": "maliapi",
         "yy ds": "maliapi",
+        "chat": "cloudmail",
+        "chatmail": "cloudmail",
+        "cloud-mail": "cloudmail",
+        "maillab": "cloudmail",
+        "catchmail.io": "catchmail",
+        "catch_mail": "catchmail",
+        "mail.tm": "mailtm",
+        "mail_tm": "mailtm",
+        "mail-tm": "mailtm",
         "mailnest.top": "mailnest",
         "mailnest_top": "mailnest",
         "迈巢": "mailnest",
@@ -101,12 +112,30 @@ def extra_from_config(config: dict) -> dict:
         "skymail_api_base": str(c.get("skymail_api_base") or "https://api.skymail.ink").strip(),
         "skymail_token": str(c.get("skymail_token") or "").strip(),
         "skymail_domain": str(c.get("skymail_domain") or "").strip(),
-        "cloudmail_api_base": str(c.get("cloudmail_api_base") or "").strip(),
+        "cloudmail_api_base": str(
+            c.get("cloudmail_api_base") or c.get("cloudmail_url") or ""
+        ).strip(),
+        "cloudmail_url": str(c.get("cloudmail_url") or c.get("cloudmail_api_base") or "").strip(),
         "cloudmail_admin_email": str(c.get("cloudmail_admin_email") or "").strip(),
         "cloudmail_admin_password": str(
-            c.get("cloudmail_admin_password") or c.get("cloudflare_api_key") or ""
+            c.get("cloudmail_admin_password")
+            or c.get("cloudmail_password")
+            or c.get("cloudflare_api_key")
+            or ""
+        ).strip(),
+        "cloudmail_password": str(
+            c.get("cloudmail_password") or c.get("cloudmail_admin_password") or ""
         ).strip(),
         "cloudmail_domain": str(c.get("cloudmail_domain") or c.get("defaultDomains") or "").strip(),
+        "defaultDomains": str(c.get("defaultDomains") or c.get("cloudmail_domain") or "").strip(),
+        "catchmail_api_base": str(
+            c.get("catchmail_api_base") or "https://api.catchmail.io"
+        ).strip(),
+        "catchmail_domain": str(c.get("catchmail_domain") or "catchmail.io").strip(),
+        "catchmail_local_len": str(c.get("catchmail_local_len") or "10").strip(),
+        "mailtm_api_base": str(c.get("mailtm_api_base") or "https://api.mail.tm").strip(),
+        "mailtm_domain": str(c.get("mailtm_domain") or "").strip(),
+        "mailtm_local_len": str(c.get("mailtm_local_len") or "10").strip(),
         "duckmail_api_url": str(c.get("duckmail_api_url") or "https://www.duckmail.sbs").strip(),
         "duckmail_provider_url": str(
             c.get("duckmail_provider_url") or "https://api.duckmail.sbs"
@@ -133,6 +162,17 @@ def extra_from_config(config: dict) -> dict:
         "cfworker_admin_token": cf_token,
         "cfworker_domain": cf_domain,
         "cfworker_domain_override": str(c.get("cfworker_domain_override") or "").strip(),
+        "cfworker_domains": c.get("cfworker_domains")
+        or c.get("defaultDomains")
+        or cf_domain,
+        "cfworker_enabled_domains": c.get("cfworker_enabled_domains")
+        or c.get("cfworker_domains")
+        or cf_domain,
+        "cfworker_domain_mode": str(c.get("cfworker_domain_mode") or "fixed").strip().lower()
+        or "fixed",
+        "cfworker_rotate_state_path": str(
+            c.get("cfworker_rotate_state_path") or ""
+        ).strip(),
         "cfworker_custom_auth": str(c.get("cfworker_custom_auth") or "").strip(),
         "cfworker_subdomain": str(c.get("cfworker_subdomain") or "").strip(),
         "cfworker_fingerprint": str(c.get("cfworker_fingerprint") or "").strip(),
@@ -165,7 +205,7 @@ def provider_ready(config: dict, provider: str) -> bool:
     p = normalize_provider(provider)
     if p in ("tempmailer", "inboxkitten", "inbox_kitten"):
         return False
-    if p in ("tempmail_lol", "moemail", "gptmail", "duckmail"):
+    if p in ("tempmail_lol", "moemail", "gptmail", "duckmail", "catchmail", "mailtm"):
         return True
     if p == "maliapi":
         return bool(
@@ -185,7 +225,14 @@ def provider_ready(config: dict, provider: str) -> bool:
     if p == "skymail":
         return bool(str(c.get("skymail_token") or "").strip())
     if p == "cloudmail":
-        return bool(str(c.get("cloudmail_api_base") or "").strip())
+        return bool(
+            str(c.get("cloudmail_api_base") or c.get("cloudmail_url") or "").strip()
+            and str(
+                c.get("cloudmail_admin_password")
+                or c.get("cloudmail_password")
+                or ""
+            ).strip()
+        )
     if p == "freemail":
         return bool(str(c.get("freemail_api_url") or "").strip())
     if p == "opentrashmail":

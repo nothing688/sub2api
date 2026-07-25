@@ -455,6 +455,8 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
         "principal_type": "User",
         "principal_id": "",
         "referrer": GROK_REFERRER,
+        # progressive-enhancement form path uses name=action value=allow/deny
+        "action": "allow",
     }
     try:
         cres = session.post(
@@ -490,6 +492,18 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
 
     if not code:
         _debug_dump_consent_html(cres.text[:5000], f"status={cres.status_code} url={redirect_url}")
+        # xAI often returns 303 access_denied for disposable/public mail domains
+        # (e.g. catchmail.io). Conversion code is fine; the account is not allowed
+        # to authorize the Grok Build OAuth client.
+        if "error=access_denied" in (redirect_url or "") or "access_denied" in (
+            cres.text or ""
+        ).lower():
+            raise ConvertError(
+                "xAI OAuth consent 拒绝 (access_denied)。"
+                "常见原因：邮箱域名被判定为临时邮/不可信，无法授权 Grok Build。"
+                "换 cfworker/自有域名/gmail_forward 注册后再转 OAuth；"
+                f"redirect={redirect_url[:180]}"
+            )
         raise ConvertError(
             f"consent 响应缺少 code: status={cres.status_code}"
             f" redirect={redirect_url[:200]}"
