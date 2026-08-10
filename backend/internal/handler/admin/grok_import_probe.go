@@ -17,7 +17,7 @@ const (
 )
 
 type grokImportProber interface {
-	QueryQuota(ctx context.Context, accountID int64) (*service.GrokQuotaProbeResult, error)
+	ProbeBilling(ctx context.Context, accountID int64) (*service.GrokQuotaProbeResult, error)
 }
 
 type grokImportProbeTask struct {
@@ -138,7 +138,7 @@ func (s *grokImportProbeScheduler) run(prober grokImportProber, accountID int64)
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
-	result, err := prober.QueryQuota(ctx, accountID)
+	result, err := prober.ProbeBilling(ctx, accountID)
 	if err != nil {
 		slog.Warn(
 			"grok_import_active_probe_failed",
