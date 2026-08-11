@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +33,28 @@ const (
 	grokRateLimitMaxAdaptiveCooldown = time.Hour
 	grokRateLimitBackoffQuietPeriod  = time.Hour
 )
+
+// Grok 429 限流冷却环境变量覆盖（秒）。与 Antigravity 的
+// GATEWAY_ANTIGRAVITY_FALLBACK_COOLDOWN_SECONDS 保持一致，未设置或非法时回退到默认常量。
+const (
+	grokRateLimitFallbackCooldownSecondsEnv    = "GROK_RATE_LIMIT_FALLBACK_COOLDOWN_SECONDS"
+	grokRateLimitRepeatCooldownSecondsEnv      = "GROK_RATE_LIMIT_REPEAT_COOLDOWN_SECONDS"
+	grokRateLimitSustainedCooldownSecondsEnv   = "GROK_RATE_LIMIT_SUSTAINED_COOLDOWN_SECONDS"
+	grokRateLimitMaxAdaptiveCooldownSecondsEnv = "GROK_RATE_LIMIT_MAX_ADAPTIVE_COOLDOWN_SECONDS"
+)
+
+// grokRateLimitCooldownOverride 读取环境变量覆盖的冷却时长（秒），非法或未设置时回退默认值。
+func grokRateLimitCooldownOverride(envKey string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(envKey))
+	if raw == "" {
+		return fallback
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds <= 0 {
+		return fallback
+	}
+	return time.Duration(seconds) * time.Second
+}
 
 func (s *OpenAIGatewayService) forwardGrokResponses(
 	ctx context.Context,
@@ -1416,7 +1440,7 @@ func grokRateLimitResetAt(snapshot *xai.QuotaSnapshot, now time.Time) (time.Time
 		return time.Time{}, false
 	}
 	if exhausted || snapshot.StatusCode == http.StatusTooManyRequests {
-		return now.Add(grokRateLimitFallbackCooldown), true
+		return now.Add(grokRateLimitCooldownOverride(grokRateLimitFallbackCooldownSecondsEnv, grokRateLimitFallbackCooldown)), true
 	}
 	return time.Time{}, false
 }
@@ -1438,12 +1462,12 @@ func grokRateLimitResetAtForAccount(account *Account, snapshot *xai.QuotaSnapsho
 		return resetAt, true
 	}
 
-	adaptiveCooldown := grokRateLimitRepeatCooldown
+	adaptiveCooldown := grokRateLimitCooldownOverride(grokRateLimitRepeatCooldownSecondsEnv, grokRateLimitRepeatCooldown)
 	switch {
-	case previousCooldown >= grokRateLimitSustainedCooldown:
-		adaptiveCooldown = grokRateLimitMaxAdaptiveCooldown
-	case previousCooldown >= grokRateLimitRepeatCooldown:
-		adaptiveCooldown = grokRateLimitSustainedCooldown
+	case previousCooldown >= grokRateLimitCooldownOverride(grokRateLimitSustainedCooldownSecondsEnv, grokRateLimitSustainedCooldown):
+		adaptiveCooldown = grokRateLimitCooldownOverride(grokRateLimitMaxAdaptiveCooldownSecondsEnv, grokRateLimitMaxAdaptiveCooldown)
+	case previousCooldown >= grokRateLimitCooldownOverride(grokRateLimitRepeatCooldownSecondsEnv, grokRateLimitRepeatCooldown):
+		adaptiveCooldown = grokRateLimitCooldownOverride(grokRateLimitSustainedCooldownSecondsEnv, grokRateLimitSustainedCooldown)
 	}
 	adaptiveResetAt := now.Add(adaptiveCooldown)
 	if adaptiveResetAt.After(resetAt) {
@@ -1454,7 +1478,7 @@ func grokRateLimitResetAtForAccount(account *Account, snapshot *xai.QuotaSnapsho
 
 func normalizeGrokRateLimitResetAt(account *Account, resetAt, now time.Time) time.Time {
 	if !resetAt.After(now) {
-		resetAt = now.Add(grokRateLimitFallbackCooldown)
+		resetAt = now.Add(grokRateLimitCooldownOverride(grokRateLimitFallbackCooldownSecondsEnv, grokRateLimitFallbackCooldown))
 	}
 	if account != nil && account.RateLimitResetAt != nil && account.RateLimitResetAt.After(resetAt) {
 		resetAt = *account.RateLimitResetAt
