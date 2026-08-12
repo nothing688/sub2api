@@ -1700,7 +1700,7 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 					}
 				}
 				if resetAt.IsZero() || !resetAt.After(now) {
-					resetAt = now.Add(decision.Cooldown)
+					resetAt = now.Add(grokRateLimitCooldownOverride(grokSpendingLimitMaxCooldownEnv, grokSpendingLimitMaxCooldown))
 				}
 				if decision.Model != "" && isGrokModelSpecificFreeUsage(strings.ToLower(decision.Reason), decision.Model) {
 					markGrokModelQuotaBlock(account.ID, decision.Model, resetAt)

@@ -117,11 +117,12 @@ func TestApplyGrokUpstreamFailure_FreeUsageWithoutResetPersistsRateLimit(t *test
 
 	svc.handleGrokAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, nil, body)
 
-	// Free-usage without observed quota headers must still persist an account-wide
-	// rate-limit (using the classifier cooldown) so the scheduler skips the account.
+	// Free-usage without observed quota headers still persists an account-wide
+	// rate-limit capped at the max cooldown (24h) so the scheduler skips the
+	// account for the whole day instead of re-selecting it within minutes.
 	require.GreaterOrEqual(t, repo.rateLimitedCalls, 1)
 	require.Equal(t, account.ID, repo.lastRateLimitedID)
-	require.True(t, repo.lastRateLimitResetAt.After(time.Now()), "reset must be in the future")
+	require.WithinDuration(t, time.Now().Add(grokSpendingLimitMaxCooldown), repo.lastRateLimitResetAt, time.Second)
 }
 
 func TestApplyGrokUpstreamFailure_SpendingLimitRemainsRecoverable(t *testing.T) {
