@@ -11,11 +11,27 @@ import (
 // fabricating a 24h boundary from the error arrival time.
 const grokSpendingLimitProbeCooldown = 10 * time.Minute
 
+// grokSpendingLimitMaxCooldown caps how far a spending-limit cooldown may
+// reach into the future. Free-tier (monthly_limit=0) accounts share an xAI
+// billing period, so taking the raw billing_period_end would lock them out for
+// the entire remaining month (up to ~30 days). Clamping to a short horizon
+// lets the pool retry periodically instead of parking the account until the
+// period boundary.
+const grokSpendingLimitMaxCooldown = 2 * time.Hour
+
+// grokSpendingLimitMaxCooldownEnv overrides grokSpendingLimitMaxCooldown in
+// seconds (e.g. "3600"). Invalid or unset values fall back to the default.
+const grokSpendingLimitMaxCooldownEnv = "GROK_SPENDING_LIMIT_MAX_COOLDOWN_SECONDS"
+
 func grokSpendingLimitResetAt(account *Account, now time.Time) time.Time {
+	maxHorizon := now.Add(grokRateLimitCooldownOverride(grokSpendingLimitMaxCooldownEnv, grokSpendingLimitMaxCooldown))
 	if account != nil {
 		if billing, err := grokBillingSnapshotFromExtra(account.Extra); err == nil && billing != nil {
 			for _, raw := range []string{billing.PeriodEnd, billing.BillingPeriodEnd} {
 				if resetAt, err := time.Parse(time.RFC3339, strings.TrimSpace(raw)); err == nil && resetAt.After(now) {
+					if resetAt.After(maxHorizon) {
+						resetAt = maxHorizon
+					}
 					return resetAt
 				}
 			}

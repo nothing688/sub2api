@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/stretchr/testify/require"
 )
 
@@ -99,4 +100,32 @@ func TestApplyGrokUpstreamFailure_SpendingLimitRemainsRecoverable(t *testing.T) 
 	require.Zero(t, repo.tempUnschedCalls)
 	// Without a billing-period snapshot, use a short recoverable probe cooldown.
 	require.WithinDuration(t, time.Now().Add(grokSpendingLimitProbeCooldown), repo.lastRateLimitResetAt, 2*time.Second)
+}
+
+func TestGrokSpendingLimitResetAtClampsBillingPeriodEnd(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 11, 18, 0, 0, 0, time.UTC)
+	account := &Account{
+		ID:    9111,
+		Extra: map[string]any{
+			grokBillingExtraKey: &xai.BillingSummary{
+				PeriodType:       "monthly",
+				BillingPeriodEnd: "2026-09-01T00:00:00Z", // ~21 days out
+			},
+		},
+	}
+
+	got := grokSpendingLimitResetAt(account, now)
+	require.True(t, got.After(now), "clamped reset must stay in the future")
+	require.False(t, got.After(now.Add(grokSpendingLimitMaxCooldown)), "reset must not exceed max cooldown horizon")
+	require.WithinDuration(t, now.Add(grokSpendingLimitMaxCooldown), got, time.Second)
+}
+
+func TestGrokSpendingLimitResetAtUsesShortProbeWithoutBilling(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 11, 18, 0, 0, 0, time.UTC)
+	got := grokSpendingLimitResetAt(&Account{ID: 9112}, now)
+	require.WithinDuration(t, now.Add(grokSpendingLimitProbeCooldown), got, time.Second)
 }
