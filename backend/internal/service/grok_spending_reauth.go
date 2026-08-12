@@ -11,13 +11,13 @@ import (
 // fabricating a 24h boundary from the error arrival time.
 const grokSpendingLimitProbeCooldown = 10 * time.Minute
 
-// grokSpendingLimitMaxCooldown caps how far a spending-limit cooldown may
-// reach into the future. Free-tier (monthly_limit=0) accounts share an xAI
-// billing period, so taking the raw billing_period_end would lock them out for
-// the entire remaining month (up to ~30 days). Clamping to a short horizon
-// lets the pool retry periodically instead of parking the account until the
-// period boundary.
-const grokSpendingLimitMaxCooldown = 2 * time.Hour
+// grokSpendingLimitMaxCooldown caps how far a spending-limit / exhausted-quota
+// cooldown may reach into the future. Free-tier (monthly_limit=0) accounts share
+// an xAI billing period, so taking the raw billing_period_end would lock them
+// out for the entire remaining month (up to ~30 days). Clamping to a 24h horizon
+// lets the pool retry daily instead of parking the account until the period
+// boundary.
+const grokSpendingLimitMaxCooldown = 24 * time.Hour
 
 // grokSpendingLimitMaxCooldownEnv overrides grokSpendingLimitMaxCooldown in
 // seconds (e.g. "3600"). Invalid or unset values fall back to the default.

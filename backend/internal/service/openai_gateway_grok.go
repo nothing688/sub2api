@@ -1689,14 +1689,24 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 			// apply only a short probe cooldown. Never start a fabricated 24h window
 			// at the instant this error was received.
 			if decision.Class == GrokFailureFreeUsage {
-				if resetAt, limited := grokRateLimitResetAtForAccount(account, parseGrokQuotaSnapshot(headers, statusCode, now), now); limited && resetAt.After(now) {
-					if decision.Model != "" && isGrokModelSpecificFreeUsage(strings.ToLower(decision.Reason), decision.Model) {
-						markGrokModelQuotaBlock(account.ID, decision.Model, resetAt)
-						return
+				// Free-tier exhaustion: persist account-wide rate-limit regardless
+				// of whether quota headers are present. Without a durable rate-limit
+				// the scheduler keeps selecting the account and fails every time.
+				snapshot := parseGrokQuotaSnapshot(headers, statusCode, now)
+				resetAt := time.Time{}
+				if snapshot != nil && snapshot.HasObservedHeaders() {
+					if candidate, limited := grokRateLimitResetAtForAccount(account, snapshot, now); limited {
+						resetAt = candidate
 					}
-					s.rateLimitGrok(ctx, account, resetAt)
-					return
 				}
+				if resetAt.IsZero() || !resetAt.After(now) {
+					resetAt = now.Add(decision.Cooldown)
+				}
+				if decision.Model != "" && isGrokModelSpecificFreeUsage(strings.ToLower(decision.Reason), decision.Model) {
+					markGrokModelQuotaBlock(account.ID, decision.Model, resetAt)
+				}
+				s.rateLimitGrok(ctx, account, resetAt)
+				return
 			}
 			if s.applyGrokUpstreamFailureDecision(ctx, account, decision) {
 				return

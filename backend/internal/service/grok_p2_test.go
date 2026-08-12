@@ -4,6 +4,8 @@ package service
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -86,6 +88,40 @@ func TestApplyGrokUpstreamFailure_ModelSpecificFreeUsage(t *testing.T) {
 	require.Zero(t, repo.tempUnschedCalls, "model-scoped free usage must not cool sibling models")
 	require.True(t, isGrokModelQuotaBlocked(account.ID, "grok-4.5", time.Now()))
 	require.False(t, isGrokModelQuotaBlocked(account.ID, "grok-4.3", time.Now()))
+}
+
+func TestApplyGrokUpstreamFailure_FreeUsageWithResetPersistsRateLimit(t *testing.T) {
+	repo := &grokQuotaAccountRepo{}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+	account := &Account{ID: 9113, Platform: PlatformGrok, Type: AccountTypeOAuth}
+	body := []byte(`{"error":{"code":"subscription:free-usage-exhausted","message":"You've used all the included free usage for model grok-4.5."}}`)
+	headers := http.Header{}
+	resetUnix := time.Now().Add(30 * time.Minute).Unix()
+	headers.Set("x-ratelimit-remaining-requests", "0")
+	headers.Set("x-ratelimit-limit-requests", "21")
+	headers.Set("x-ratelimit-reset-requests", fmt.Sprintf("%d", resetUnix))
+
+	svc.handleGrokAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, headers, body)
+
+	// The account must be durably rate-limited so the scheduler stops selecting
+	// it (in-memory model blocks alone are invisible to account selection).
+	require.GreaterOrEqual(t, repo.rateLimitedCalls, 1)
+	require.Equal(t, account.ID, repo.lastRateLimitedID)
+}
+
+func TestApplyGrokUpstreamFailure_FreeUsageWithoutResetPersistsRateLimit(t *testing.T) {
+	repo := &grokQuotaAccountRepo{}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+	account := &Account{ID: 9114, Platform: PlatformGrok, Type: AccountTypeOAuth}
+	body := []byte(`{"error":{"code":"subscription:free-usage-exhausted","message":"You've used all the included free usage for model grok-4.5."}}`)
+
+	svc.handleGrokAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, nil, body)
+
+	// Free-usage without observed quota headers must still persist an account-wide
+	// rate-limit (using the classifier cooldown) so the scheduler skips the account.
+	require.GreaterOrEqual(t, repo.rateLimitedCalls, 1)
+	require.Equal(t, account.ID, repo.lastRateLimitedID)
+	require.True(t, repo.lastRateLimitResetAt.After(time.Now()), "reset must be in the future")
 }
 
 func TestApplyGrokUpstreamFailure_SpendingLimitRemainsRecoverable(t *testing.T) {
