@@ -1392,6 +1392,22 @@ func normalizeGrokExhaustedWindowResets(snapshot *xai.QuotaSnapshot, resetAt, no
 	}
 }
 
+// clampGrokRateLimitResetAt caps an upstream-provided reset time so a quota
+// window that reports remaining=0 with a reset header pointing at the xAI
+// billing period boundary (e.g. 2026-09-01 for free accounts) cannot park the
+// account for the rest of the period. Reuses the spending-limit max cooldown
+// horizon so free accounts retry periodically instead of being locked out.
+func clampGrokRateLimitResetAt(resetAt, now time.Time) time.Time {
+	if resetAt.IsZero() || !resetAt.After(now) {
+		return resetAt
+	}
+	maxHorizon := now.Add(grokRateLimitCooldownOverride(grokSpendingLimitMaxCooldownEnv, grokSpendingLimitMaxCooldown))
+	if resetAt.After(maxHorizon) {
+		return maxHorizon
+	}
+	return resetAt
+}
+
 func grokRateLimitResetAt(snapshot *xai.QuotaSnapshot, now time.Time) (time.Time, bool) {
 	if snapshot == nil {
 		return time.Time{}, false
@@ -1408,7 +1424,7 @@ func grokRateLimitResetAt(snapshot *xai.QuotaSnapshot, now time.Time) (time.Time
 		}
 		retryAfterResetAt := observedAt.Add(time.Duration(*snapshot.RetryAfterSeconds) * time.Second)
 		if retryAfterResetAt.After(now) {
-			resetAt = retryAfterResetAt
+			resetAt = clampGrokRateLimitResetAt(retryAfterResetAt, now)
 		} else {
 			retryAfterExpired = true
 		}
@@ -1422,9 +1438,9 @@ func grokRateLimitResetAt(snapshot *xai.QuotaSnapshot, now time.Time) (time.Time
 		exhausted = true
 		candidate := time.Time{}
 		if window.ResetUnix != nil && *window.ResetUnix > 0 {
-			candidate = time.Unix(*window.ResetUnix, 0)
+			candidate = clampGrokRateLimitResetAt(time.Unix(*window.ResetUnix, 0), now)
 		} else if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(window.ResetAt)); err == nil {
-			candidate = parsed
+			candidate = clampGrokRateLimitResetAt(parsed, now)
 		}
 		if candidate.After(now) && candidate.After(resetAt) {
 			resetAt = candidate
