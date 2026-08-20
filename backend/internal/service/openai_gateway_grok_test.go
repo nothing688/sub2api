@@ -3008,6 +3008,50 @@ func TestGrokRateLimitResetAtUsesFutureWindowAfterRetryAfterExpires(t *testing.T
 	require.WithinDuration(t, windowReset, resetAt, time.Second)
 }
 
+func TestGrokRateLimitResetAtClampsFarFutureResetUnix(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	// xAI free accounts report token resets at the billing period boundary,
+	// which can be weeks away (e.g. 2026-09-01). The cooldown must be clamped
+	// to the max horizon so the account retries periodically instead of being
+	// parked until the period end.
+	farReset := now.Add(30 * 24 * time.Hour)
+	snapshot := &xai.QuotaSnapshot{
+		StatusCode: http.StatusTooManyRequests,
+		UpdatedAt:  now.Format(time.RFC3339),
+		Tokens: &xai.QuotaWindow{
+			Limit:     grokInt64PtrForTest(1_000_000),
+			Remaining: grokInt64PtrForTest(0),
+			ResetUnix: grokInt64PtrForTest(farReset.Unix()),
+		},
+	}
+
+	resetAt, limited := grokRateLimitResetAt(snapshot, now)
+
+	require.True(t, limited)
+	require.True(t, resetAt.After(now), "clamped reset must stay in the future")
+	require.False(t, resetAt.After(now.Add(grokSpendingLimitMaxCooldown)), "reset must not exceed max horizon")
+	require.WithinDuration(t, now.Add(grokSpendingLimitMaxCooldown), resetAt, time.Second)
+}
+
+func TestGrokRateLimitResetAtKeepsShortWindowResetUnclamped(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	nearReset := now.Add(45 * time.Minute)
+	snapshot := &xai.QuotaSnapshot{
+		StatusCode: http.StatusTooManyRequests,
+		UpdatedAt:  now.Format(time.RFC3339),
+		Requests: &xai.QuotaWindow{
+			Limit:     grokInt64PtrForTest(10),
+			Remaining: grokInt64PtrForTest(0),
+			ResetUnix: grokInt64PtrForTest(nearReset.Unix()),
+		},
+	}
+
+	resetAt, limited := grokRateLimitResetAt(snapshot, now)
+
+	require.True(t, limited)
+	require.WithinDuration(t, nearReset, resetAt, time.Second)
+}
+
 func TestHandleGrokAccountUpstreamError429DoesNotShortenExistingPause(t *testing.T) {
 	existingUntil := time.Now().Add(15 * time.Minute)
 	account := &Account{

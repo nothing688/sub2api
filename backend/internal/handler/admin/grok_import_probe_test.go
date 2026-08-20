@@ -36,7 +36,7 @@ func newGrokImportProbeStub(buffer int) *grokImportProbeStub {
 	}
 }
 
-func (s *grokImportProbeStub) QueryQuota(ctx context.Context, accountID int64) (*service.GrokQuotaProbeResult, error) {
+func (s *grokImportProbeStub) ProbeBilling(ctx context.Context, accountID int64) (*service.GrokQuotaProbeResult, error) {
 	_, deadlineSeen := ctx.Deadline()
 	s.mu.Lock()
 	s.calls[accountID]++
